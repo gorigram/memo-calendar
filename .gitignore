@@ -1,0 +1,24 @@
+dist/
+site.tar.gz
+node_modules/
+.pnpm-store/
+
+# Local Cloudflare state, OAuth/session artifacts, and runtime credentials
+.wrangler/
+.mf/
+.sites-runtime/
+.env*
+!.env.example
+.dev.vars*
+!.dev.vars.example
+
+# Local database files and logs
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.log
+
+# Local QA captures and deliverable exports belong outside the source tree
+screenshots/
+outputs/

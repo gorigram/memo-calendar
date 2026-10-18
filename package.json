@@ -1,0 +1,22 @@
+{
+  "name": "memo-calendar-worker",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "validate": "node scripts/validate-artifact.mjs",
+    "dev": "node scripts/build.mjs && node scripts/dev.mjs",
+    "test": "node --test",
+    "icons": "node scripts/generate-icons.mjs",
+    "db:generate": "drizzle-kit generate",
+    "cf:whoami": "wrangler whoami"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2",
+    "drizzle-kit": "0.31.11",
+    "wrangler": "4.151.1"
+  },
+  "dependencies": {
+    "drizzle-orm": "0.45.4"
+  }
+}

@@ -1,0 +1,6 @@
+GOOGLE_CLIENT_ID=replace-with-web-oauth-client-id
+GOOGLE_CLIENT_SECRET=replace-with-web-oauth-client-secret
+APP_SESSION_SECRET=replace-with-random-32-byte-or-longer-secret
+TOKEN_ENCRYPTION_KEY=replace-with-base64url-encoded-32-byte-key
+APP_ORIGIN=http://localhost:8787
+TRUST_SITES_IDENTITY=false
