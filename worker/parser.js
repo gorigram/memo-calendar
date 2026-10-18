@@ -110,12 +110,14 @@ export function parseMemo(text, now = new Date(), timeZone = Intl.DateTimeFormat
   date.setUTCHours(hour, minute, 0, 0);
 
   let durationMinutes = 60;
+  let durationSpecified = false;
   const durationSource = source.replace(timeMatch[0], ' ');
   const duration = durationSource.match(/(?:所要時間|約)?\s*(\d+)\s*(時間|分)(半)?(?:ほど|くらい|程度)?/);
-  if (duration) durationMinutes = Number(duration[1]) * (duration[2] === '時間' ? 60 : 1) + (duration[3] && duration[2] === '時間' ? 30 : 0);
+  if (duration) { durationSpecified = true; durationMinutes = Number(duration[1]) * (duration[2] === '時間' ? 60 : 1) + (duration[3] && duration[2] === '時間' ? 30 : 0); }
   else {
     const range = durationSource.match(/(?:から|〜|～|－|—)\s*(午前|午後|夕方|夜|昼|朝)?\s*(\d{1,2})(?::(\d{2})|時(半|\d{1,2}分?)?)?/);
     if (range) {
+      durationSpecified = true;
       let endHour = Number(range[2]);
       if (range[1] === '午後' || range[1] === '夕方' || range[1] === '夜') { if (endHour < 12) endHour += 12; }
       else if ((range[1] === '午前' || range[1] === '朝') && endHour === 12) endHour = 0;
@@ -150,6 +152,7 @@ export function parseMemo(text, now = new Date(), timeZone = Intl.DateTimeFormat
   return {
     ok: true,
     mode: 'rules',
+    durationSpecified,
     event: { title, start: instantFromWallDate(date, timeZone).toISOString(), end: new Date(instantFromWallDate(date, timeZone).getTime() + durationMinutes * 60000).toISOString(), recurrence, timezone: timeZone },
   };
 }

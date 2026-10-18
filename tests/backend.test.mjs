@@ -97,6 +97,30 @@ test("AI cannot add a missing start time or replace the rule-checked date", asyn
   assert.equal(result.event.start, "2026-10-20T05:00:00.000Z");
 });
 
+test("authenticated AI can refine a Japanese title but cannot change validated temporal fields", async () => {
+  let prompt = "";
+  const env = { APP_SESSION_SECRET: secret, AI: { async run(_model, input) {
+    prompt = input.prompt;
+    return { response: JSON.stringify({ title: "山田さんと新商品の見積もり相談", start: "2026-10-20T14:00:00+09:00", end: "2030-01-01T00:00:00Z", timezone: "UTC", recurrence: ["RRULE:FREQ=DAILY"] }) };
+  } } };
+  const response = await handleApi(new Request("https://app.example/api/parse", {
+    method: "POST",
+    headers: { cookie: await cookie(), origin: "https://app.example", "content-type": "application/json" },
+    body: JSON.stringify({ text: "2026年10月20日 14時、山田さんに新商品の見積もりを相談する約束", timezone: "Asia/Tokyo" }),
+  }), env, {});
+  const result = await response.json();
+  assert.equal(result.mode, "ai");
+  assert.equal(result.event.title, "山田さんと新商品の見積もり相談");
+  assert.equal(result.event.start, "2026-10-20T05:00:00.000Z");
+  assert.equal(result.event.end, "2026-10-20T06:00:00.000Z");
+  assert.equal(result.event.timezone, "Asia/Tokyo");
+  assert.deepEqual(result.event.recurrence, []);
+  assert.match(prompt, /現在日時は .*（UTC）/);
+  assert.match(prompt, /検証済みの予定情報/);
+  assert.match(prompt, /Asia\/Tokyo/);
+  assert.match(prompt, /2026-10-20T05:00:00\.000Z/);
+});
+
 test("authenticated event routes validate required explicit start and isolate by session", async () => {
   const db = fakeDb(), env = { DB: db, APP_SESSION_SECRET: secret };
   const request = new Request("https://app.example/api/events", { method: "POST", headers: { cookie: await cookie(), origin: "https://app.example", "content-type": "application/json" }, body: JSON.stringify({ event: { title: "Review", start: "not a date" } }) });

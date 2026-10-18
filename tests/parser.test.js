@@ -8,6 +8,7 @@ test('parses relative Japanese dates, meridiem, and an explicit duration', () =>
   const result = parseMemo('明日 午後3時 セミナー 1時間半', reference);
   assert.equal(result.ok, true);
   assert.equal(result.event.title, 'セミナー');
+  assert.equal(result.durationSpecified, true);
   const start = new Date(result.event.start);
   const end = new Date(result.event.end);
   assert.equal(start.getDate(), 19);
@@ -20,6 +21,15 @@ test('requires a start time and does not invent one', () => {
   assert.equal(result.ok, false);
   assert.equal(result.needsClarification, true);
   assert.equal(result.reason, 'missing-time');
+});
+
+test('marks the one-hour fallback only when no duration or end time was provided', () => {
+  const fallback = parseMemo('今日 14時 歯医者', reference);
+  const explicitMinutes = parseMemo('今日 14時 QA 90分', reference);
+  const explicitRange = parseMemo('今日 14時から15時 QA', reference);
+  assert.equal(fallback.durationSpecified, false);
+  assert.equal(explicitMinutes.durationSpecified, true);
+  assert.equal(explicitRange.durationSpecified, true);
 });
 
 test('asks for a weekday when a relative week is underspecified', () => {

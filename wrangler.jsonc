@@ -1,17 +1,24 @@
 {
-  "$schema": "./node_modules/wrangler/config-schema.json",
-  "name": "memo-calendar-glass",
-  "main": "worker/index.js",
-  "compatibility_date": "2026-10-01",
-  "workers_dev": true,
-  "ai": { "binding": "AI" },
-  "d1_databases": [
-    {
-      "binding": "DB",
-      "database_name": "memo-calendar-glass",
-      "database_id": "REPLACE_WITH_D1_DATABASE_ID",
-      "migrations_dir": "migrations"
-    }
-  ],
-  "vars": { "TRUST_SITES_IDENTITY": "false" }
+	"$schema": "./node_modules/wrangler/config-schema.json",
+	"name": "memo-calendar-glass",
+	"main": "worker/index.js",
+	"account_id": "154fc04d10990856b4afd7e2ef3d97c6",
+	"compatibility_date": "2026-10-01",
+	"keep_names": false,
+	"workers_dev": true,
+	"ai": {
+		"binding": "AI"
+	},
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "memo-calendar-glass",
+			"database_id": "84979952-c925-4ca6-82cc-dddea4e8b838",
+			"migrations_dir": "migrations"
+		}
+	],
+	"vars": {
+		"APP_ORIGIN": "https://memo-calendar-glass.maponaru0519.workers.dev",
+		"TRUST_SITES_IDENTITY": "false"
+	}
 }
