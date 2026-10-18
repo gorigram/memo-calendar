@@ -41,6 +41,10 @@ test("Wrangler production bundle serves a page whose embedded parser runs indepe
   const response = await workerModule.default.fetch(new Request("https://memo-calendar.local/"), {}, { waitUntil() {} });
   assert.equal(response.status, 200);
   const html = await response.text();
+  assert.match(html, /<title>ゴレンダー — 予定メモ<\/title>/);
+  assert.match(html, /id="googleRefreshButton"/);
+  assert.match(html, /id="googleImportStatus"/);
+  assert.doesNotMatch(html, />undefined<\/svg>/);
   const parserScript = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
   assert.ok(parserScript, "page contains the embedded parser script");
 
@@ -60,4 +64,27 @@ test("Wrangler production bundle serves a page whose embedded parser runs indepe
   assert.equal(typeof eventModel?.normalizeRecurrence, "function");
   assert.equal(eventModel.normalizeRecurrence(["RRULE:FREQ=WEEKLY"]), "weekly");
   assert.deepEqual(Array.from(eventModel.serializeEvent({ recurrence: "weekly" }).recurrence), ["RRULE:FREQ=WEEKLY"]);
+  assert.equal(typeof eventModel.localEventInstant, "function");
+  const allDay = new Date(eventModel.localEventInstant("2026-10-20"));
+  assert.equal(allDay.getDate(), 20);
+  assert.equal(typeof eventModel.mergeCalendarEvents, "function");
+  assert.equal(typeof eventModel.allDayOccurrences, "function");
+  const clipped = eventModel.allDayOccurrences(
+    { id: "holiday", start: eventModel.localEventInstant("2026-10-18"), end: eventModel.localEventInstant("2026-10-22"), allDay: true },
+    new Date(2026, 9, 19),
+    new Date(2026, 9, 26),
+  );
+  assert.deepEqual(Array.from(clipped.map(item => item.start.getDate())), [19, 20, 21]);
+  const merged = eventModel.mergeCalendarEvents(
+    [{ id: "app", title: "old", googleEventId: "owned", cloudStored: true }],
+    [
+      { id: "daily-1", googleEventId: "daily-1", recurringEventId: "series", start: "2026-10-20T09:00:00Z" },
+      { id: "daily-2", googleEventId: "daily-2", recurringEventId: "series", start: "2026-10-21T09:00:00Z" },
+      { id: "owned-instance", googleEventId: "owned-1", recurringEventId: "owned" },
+    ],
+    [{ id: "app", title: "moved", start: "2026-10-22T09:00:00Z", end: "2026-10-22T10:00:00Z" }],
+  );
+  assert.deepEqual(Array.from(merged.map(event => event.id)), ["app", "daily-1", "daily-2"]);
+  assert.equal(merged[0].title, "moved");
+  assert.equal(merged[0].cloudStored, true);
 });

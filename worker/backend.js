@@ -6,6 +6,7 @@ const GOOGLE_AUTH = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN = "https://oauth2.googleapis.com/token";
 const CALENDAR = "https://www.googleapis.com/calendar/v3";
 const SCOPES = "openid email https://www.googleapis.com/auth/calendar.events";
+const MAX_GOOGLE_IMPORT_WINDOW_MS = 93 * 24 * 60 * 60 * 1000;
 const json = (value, status = 200, headers = {}) => new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", ...headers } });
 const err = (message, status = 400) => json({ ok: false, error: message }, status);
 const b64 = (bytes) => btoa(String.fromCharCode(...new Uint8Array(bytes))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
@@ -174,6 +175,88 @@ async function syncSavedEvent(sub, event, env) {
     return { status: "synced", googleEventId, syncedAt };
   } catch (error) { return { status: "failed", message: error.message }; }
 }
+function parseImportInstant(value) {
+  if (typeof value !== "string") return null;
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,3})?(Z|([+-])(\d{2}):(\d{2}))$/.exec(value);
+  if (!match) return null;
+  const [, year, month, day, hour, minute, second, , , offsetHour, offsetMinute] = match;
+  const y = Number(year), m = Number(month), d = Number(day), h = Number(hour), min = Number(minute), sec = Number(second);
+  const leapYear = y % 4 === 0 && (y % 100 !== 0 || y % 400 === 0);
+  const days = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (m < 1 || m > 12 || d < 1 || d > days[m - 1] || h > 23 || min > 59 || sec > 59 || Number(offsetHour || 0) > 23 || Number(offsetMinute || 0) > 59) return null;
+  const time = Date.parse(value);
+  return Number.isFinite(time) ? new Date(time).toISOString() : null;
+}
+async function googleEvents(request, env) {
+  const sub = await userId(request, env);
+  if (!sub) return err("Google sign-in required", 401);
+  if (!await requireDb(env)) return err("Cloud storage is unavailable.", 503);
+  const url = new URL(request.url), timeMin = parseImportInstant(url.searchParams.get("timeMin")), timeMax = parseImportInstant(url.searchParams.get("timeMax"));
+  if (!timeMin || !timeMax || Date.parse(timeMax) <= Date.parse(timeMin)) return err("Provide valid ISO timeMin and timeMax values.");
+  if (Date.parse(timeMax) - Date.parse(timeMin) > MAX_GOOGLE_IMPORT_WINDOW_MS) return err("Google Calendar import range cannot exceed 93 days.");
+  const connected = await db(env).prepare("SELECT user_id FROM google_tokens WHERE user_id = ?").bind(sub).first();
+  if (!connected) return err("Google Calendar is not connected.", 409);
+  let token;
+  try { token = await accessToken(sub, env); } catch (error) { return err(error.message || "Google Calendar authorization failed.", 502); }
+  const appRows = (await db(env).prepare("SELECT id,title,start,end,timezone,recurrence,google_event_id FROM events WHERE user_id = ?").bind(sub).all()).results;
+  const appById = new Map(appRows.map(row => [row.id, row]));
+  const appByGoogleId = new Map(appRows.filter(row => row.google_event_id).map(row => [row.google_event_id, row]));
+  const collected = [], appEventOverrides = [], seenAppOverrides = new Set();
+  let pageToken = null, pages = 0;
+  try {
+    do {
+      const query = new URLSearchParams({ timeMin, timeMax, singleEvents: "true", orderBy: "startTime", showDeleted: "true", maxResults: "2500", fields: "nextPageToken,items(id,summary,status,start,end,recurringEventId,originalStartTime,extendedProperties)" });
+      if (pageToken) query.set("pageToken", pageToken);
+      const response = await apiFetch(`${CALENDAR}/calendars/primary/events?${query}`, token);
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(result.error?.message || `Google Calendar returned ${response.status}`);
+      for (const event of result.items || []) {
+        if (!event?.id) continue;
+        const memoId = event.extendedProperties?.private?.memoCalendarId;
+        const linkedAppEvent = (memoId && appById.get(memoId)) || appByGoogleId.get(event.id) || (event.recurringEventId && appByGoogleId.get(event.recurringEventId));
+        if (linkedAppEvent) {
+          let recurrence = [];
+          try { recurrence = JSON.parse(linkedAppEvent.recurrence || "[]"); } catch {}
+          if (event.status === "cancelled") {
+            if (!recurrence.length && !seenAppOverrides.has(linkedAppEvent.id)) {
+              appEventOverrides.push({ id: linkedAppEvent.id, deleted: true, source: "google", liveOverride: true, googleEventId: event.id });
+              seenAppOverrides.add(linkedAppEvent.id);
+            }
+          } else if (!recurrence.length && event.start && event.end && !seenAppOverrides.has(linkedAppEvent.id)) {
+            const allDay = typeof event.start.date === "string";
+            const start = allDay ? event.start.date : iso(event.start.dateTime), end = allDay ? event.end.date : iso(event.end.dateTime);
+            if (start && end) {
+              appEventOverrides.push({ id: linkedAppEvent.id, title: typeof event.summary === "string" && event.summary.trim() ? event.summary.trim() : "（タイトルなし）", start, end, timezone: event.start.timeZone || event.end.timeZone || linkedAppEvent.timezone || "UTC", allDay, source: "google", readOnly: false, liveOverride: true, googleEventId: event.id });
+              seenAppOverrides.add(linkedAppEvent.id);
+            }
+          }
+          continue;
+        }
+        // A private property by itself is not trusted for ownership; only current D1 IDs link an app event.
+        if (!event.start || !event.end || event.status === "cancelled") continue;
+        const allDay = typeof event.start.date === "string";
+        const start = allDay ? event.start.date : iso(event.start.dateTime);
+        const end = allDay ? event.end.date : iso(event.end.dateTime);
+        if (!start || !end) continue;
+        collected.push({ id: `gcal-${event.id}`, googleEventId: event.id, title: typeof event.summary === "string" && event.summary.trim() ? event.summary.trim() : "（タイトルなし）", start, end, timezone: event.start.timeZone || event.end.timeZone || "UTC", recurrence: [], recurring: Boolean(event.recurringEventId), recurringEventId: event.recurringEventId || null, originalStartTime: event.originalStartTime || null, allDay, source: "google", readOnly: true });
+      }
+      pageToken = result.nextPageToken || null;
+      pages++;
+      if (pages >= 10 && pageToken) throw new Error("Too many Google Calendar results. Narrow the date range and try again.");
+    } while (pageToken);
+  } catch (error) { return err(error.message || "Could not read Google Calendar events.", 502); }
+  // If a previously synced one-off event disappeared or moved out of this window, tell the UI to hide its stale D1 copy.
+  for (const appEvent of appRows) {
+    if (!appEvent.google_event_id || seenAppOverrides.has(appEvent.id)) continue;
+    let recurrence = [];
+    try { recurrence = JSON.parse(appEvent.recurrence || "[]"); } catch {}
+    if (recurrence.length) continue;
+    if (Date.parse(appEvent.start) < Date.parse(timeMax) && Date.parse(appEvent.end) > Date.parse(timeMin)) {
+      appEventOverrides.push({ id: appEvent.id, deleted: true, source: "google", liveOverride: true, googleEventId: appEvent.google_event_id });
+    }
+  }
+  return json({ ok: true, events: collected, appEventOverrides, timeMin, timeMax });
+}
 export async function handleApi(request, env, ctx) {
   const url = new URL(request.url), path = url.pathname;
   if (!path.startsWith("/api/")) return null;
@@ -186,6 +269,7 @@ export async function handleApi(request, env, ctx) {
   if (path === "/api/parse" && request.method === "POST") return parseMemo(request, env);
   if (path === "/api/google/connect" && request.method === "GET") return beginOAuth(request, env);
   if (path === "/api/google/callback" && request.method === "GET") return oauthCallback(request, env);
+  if (path === "/api/google/events" && request.method === "GET") return googleEvents(request, env);
   if (request.method !== "GET" && !(await requireDb(env))) return err("Cloud storage is unavailable. Your browser can continue in local mode.", 503);
   if (path.startsWith("/api/events") && !(await requireDb(env))) return err("Cloud storage is unavailable. Your browser can continue in local mode.", 503);
   if (path === "/api/google/sync" && request.method === "POST") {

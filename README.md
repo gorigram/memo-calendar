@@ -1,8 +1,8 @@
-# michi — 予定メモ
+# ゴレンダー — 予定メモ
 
 iPhoneを主な利用端末として設計した、日本語のスケジュール管理PWAです。画面を開くと入力欄が見え、メモを入力すると予定の候補を表示します。2.4秒後に自動で端末へ保存する設定を初期状態で有効にしています。カウントダウン中はキャンセルでき、IMEで日本語を変換している間は保存しません。手動で追加する場合は「予定を追加」を押します。
 
-公開プレビュー: [memo-calendar-glass.maponaru0519.workers.dev](https://memo-calendar-glass.maponaru0519.workers.dev) · ソース: [github.com/gorigram/memo-calendar](https://github.com/gorigram/memo-calendar)
+公開プレビュー: [ゴレンダー](https://memo-calendar-glass.maponaru0519.workers.dev) · ソース: [github.com/gorigram/memo-calendar](https://github.com/gorigram/memo-calendar)
 
 ## 技術構成
 
@@ -12,6 +12,7 @@ iPhoneを主な利用端末として設計した、日本語のスケジュー�
 - 予定は最初にブラウザの`localStorage`へ保存します。Google認証後はD1を使い、端末のみの予定とクラウドの予定を区別して表示します。
 - 公開WorkerにはD1 (`DB`) とWorkers AI (`AI`) のbindingを設定しています。D1はGoogle接続後の予定保存に使い、AIは任意の補助解析に使います。外部AIプロバイダーのAPIキーは不要です。AIを使えない場合もルール解析とローカル保存が動きます。
 - Google Calendarへの自動同期は、Google接続後に設定でオンにした場合だけ実行します。同期結果が失敗や一部失敗なら画面にその状態を残します。
+- Google Calendarにすでにある予定は、表示中の週を都度読み込んで一緒に表示します。読み込んだ予定はGoogle Calendar側のデータを参照するだけで、編集・削除はGoogle Calendarで行います。繰り返し予定は対象期間内の各回を読み込みます。
 
 ## メモ解析
 
@@ -33,9 +34,11 @@ pnpm validate
 pnpm dev
 ```
 
-本番QAでは個人のGoogleアカウントでOAuth接続を確認し、予定の作成、タイトル編集、所要時間変更をGoogle Calendar側でも確認しました。週次予定の自動同期後、再読み込みして当週分と翌週分が表示されることも確認しています。テスト予定をアプリから削除した後、Google Calendarで検索結果が空になることを確認し、QA用予定をアプリ・D1・Calendarから削除済みです。既存のGoogle Calendar予定を読み込む機能はなく、このアプリから作成・同期した予定を扱います。
+本番QAでは個人のGoogleアカウントでOAuth接続を確認し、予定の作成、タイトル編集、所要時間変更をGoogle Calendar側でも確認しました。週次予定の自動同期後、再読み込みして当週分と翌週分が表示されることも確認しています。Google Calendar既存予定の読み込みでは、週の再読み込み、Google側でのタイトル変更と終日化の反映、Google側で削除した予定がアプリから消えることを確認しました。翌週の表示ではGoogle由来の予定とアプリ作成予定が並び、重複がないことも確認しています。テスト用の予定は削除済みで、既存の個人予定は変更していません。
 
 Workers AIを使ったタイトル整理は本番で確認済みです。AIは予定タイトルの補助に使い、日付・開始時刻・終了時刻はルール解析と検証で決めます。試験は作成者の個人アカウントで行っており、複数利用者での運用確認ではありません。ブラウザーの1280px幅デスクトップ表示と390×844 CSSピクセルの固定フレーム表示を確認しました。モバイルフレームで「QAモバイル90min」を入力し、14:00–15:30の解析結果と端末内への自動保存を確認しました。実測幅390px・高さ844px、文書と本文の幅375pxで横はみ出しはありませんでした。フレーム内の編集操作は未確認です。iPhone実機Safariでの表示やホーム画面追加も未検証です。D1とWorkers AIのbindingは公開Workerに設定済みです。
+
+Google Calendarの既存予定は、表示中の週をGoogle Calendar APIから都度取得します。D1へ複製せず、読み込んだ予定はアプリ内で読み取り専用です。Google側で編集・削除した結果は次の読み込み時に反映し、Google Calendarの繰り返し予定は各回として表示します。アプリからGoogleへ同期した予定は二重表示を避け、リンク済みの単発予定はGoogle側の最新内容を表示します。アプリ作成の繰り返し予定に対するGoogle側の個別回例外は、現在アプリ内の繰り返し表示へ反映されない場合があります。Google側での外部予定の更新、終日表示、削除、翌週の重複回避を本番QAで確認しました。
 
 Google OAuthは`External / Testing`モードで、現在は指定したテストユーザーだけが接続できます。Googleのテストモードでは、基本プロフィール以外のスコープを含む認可のrefresh tokenは7日で期限切れになるため、期限後は再接続が必要です。[Google OAuthのテストモードとrefresh token](https://developers.google.com/identity/protocols/oauth2/) · [OAuthアプリのテストユーザー設定](https://support.google.com/cloud/answer/15549945?hl=en)。WebアプリとGitHubのソースは公開していますが、Googleログインは一般公開ではありません。一般利用者へOAuthを提供する前に、Google側の公開設定やプライバシーポリシーなどを整え、利用範囲に応じた審査要件に従います。独自ドメインなども、その要件に合わせて準備します。
 
