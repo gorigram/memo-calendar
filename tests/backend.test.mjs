@@ -151,6 +151,111 @@ test("event creation gives an omitted end a one-hour default", async () => {
   assert.match(db.calls.at(-1).sql, /ON CONFLICT\(user_id,id\) DO UPDATE/);
 });
 
+test("tasks require a real due date, accept optional 24-hour time, and never autosync to Google", async () => {
+  const db = fakeDb(), env = { DB: db, APP_SESSION_SECRET: secret };
+  const invalidDate = await handleApi(new Request("https://app.example/api/events", { method: "POST", headers: { cookie: await cookie(), origin: "https://app.example", "content-type": "application/json" }, body: JSON.stringify({ autoSync: true, event: { type: "task", title: "Task", dueDate: "2026-02-30", dueTime: null } }) }), env, {});
+  assert.equal(invalidDate.status, 400);
+  const invalidTime = await handleApi(new Request("https://app.example/api/events", { method: "POST", headers: { cookie: await cookie(), origin: "https://app.example", "content-type": "application/json" }, body: JSON.stringify({ event: { type: "task", title: "Task", dueDate: "2026-10-20", dueTime: "25:00" } }) }), env, {});
+  assert.equal(invalidTime.status, 400);
+  assert.equal(db.calls.length, 0);
+  const response = await handleApi(new Request("https://app.example/api/events", { method: "POST", headers: { cookie: await cookie(), origin: "https://app.example", "content-type": "application/json" }, body: JSON.stringify({ autoSync: true, event: { id: "task-jst", type: "task", title: "Submit application", dueDate: "2026-10-20", dueTime: "15:30", timezone: "Asia/Tokyo" } }) }), env, {});
+  assert.equal(response.status, 201);
+  const value = await response.json();
+  assert.equal(value.event.type, "task");
+  assert.equal(value.event.dueDate, "2026-10-20");
+  assert.equal(value.event.dueTime, "15:30");
+  assert.equal(value.event.completed, false);
+  assert.equal(value.event.start, "2026-10-20T06:30:00.000Z");
+  assert.equal(value.event.end, "2026-10-20T06:31:00.000Z");
+  assert.equal(value.sync.status, "not-applicable");
+  assert.equal(db.calls.length, 1, "task creation only writes its account-scoped D1 row");
+  assert.match(db.calls[0].sql, /due_date,due_time,completed/);
+  assert.equal(db.calls[0].args[1], "google-user-1");
+  assert.equal(db.calls[0].args[7], "task");
+  assert.equal(db.calls[0].args[8], "2026-10-20");
+  assert.equal(db.calls[0].args[9], "15:30");
+  assert.equal(db.calls[0].args[10], 0);
+});
+
+test("task due dates stay on their selected local calendar day in UTC+14 and reject nonexistent DST times", async () => {
+  const db = fakeDb(), env = { DB: db, APP_SESSION_SECRET: secret };
+  const headers = { cookie: await cookie(), origin: "https://app.example", "content-type": "application/json" };
+  const localNoon = await handleApi(new Request("https://app.example/api/events", {
+    method: "POST", headers,
+    body: JSON.stringify({ event: { id: "task-kiritimati", type: "task", title: "Due today", dueDate: "2026-10-20", timezone: "Pacific/Kiritimati" } }),
+  }), env, {});
+  assert.equal(localNoon.status, 201);
+  const saved = await localNoon.json();
+  assert.equal(saved.event.dueDate, "2026-10-20");
+  assert.equal(saved.event.start, "2026-10-19T22:00:00.000Z", "local noon in UTC+14 is still Oct 20 locally");
+
+  const nonexistent = await handleApi(new Request("https://app.example/api/events", {
+    method: "POST", headers,
+    body: JSON.stringify({ event: { type: "task", title: "DST gap", dueDate: "2026-03-08", dueTime: "02:30", timezone: "America/Los_Angeles" } }),
+  }), env, {});
+  assert.equal(nonexistent.status, 400);
+  assert.match((await nonexistent.json()).error, /does not exist/);
+  assert.equal(db.calls.length, 1, "invalid wall time is rejected before persistence");
+});
+
+test("task CRUD and selected sync never call Google Calendar, even when autosync is requested", async () => {
+  const db = fakeDb(), userCookie = await cookie();
+  db.allRows = [{ id: "task-never-sync", title: "Submit report", start: "2026-10-20T03:00:00.000Z", end: "2026-10-20T03:01:00.000Z", timezone: "Asia/Tokyo", recurrence: "[]", type: "task", due_date: "2026-10-20", due_time: null, completed: 0, google_event_id: null }];
+  const env = { DB: db, APP_SESSION_SECRET: secret, TOKEN_ENCRYPTION_KEY: Buffer.alloc(32).toString("base64url") };
+  let outbound = 0;
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async () => { outbound++; throw new Error("tasks must not reach Google Calendar"); };
+  try {
+    const create = await handleApi(new Request("https://app.example/api/events", { method: "POST", headers: { cookie: userCookie, origin: "https://app.example", "content-type": "application/json" }, body: JSON.stringify({ autoSync: true, event: { id: "task-never-sync", type: "task", title: "Submit report", dueDate: "2026-10-20", timezone: "Asia/Tokyo" } }) }), env, {});
+    assert.equal(create.status, 201);
+    assert.equal((await create.json()).sync.status, "not-applicable");
+    const update = await handleApi(new Request("https://app.example/api/events/task-never-sync", { method: "PUT", headers: { cookie: userCookie, origin: "https://app.example", "content-type": "application/json" }, body: JSON.stringify({ autoSync: true, event: { type: "task", title: "Submit final report", dueDate: "2026-10-20", completed: true, timezone: "Asia/Tokyo" } }) }), env, {});
+    assert.equal(update.status, 200);
+    assert.equal((await update.json()).sync.status, "not-applicable");
+    const sync = await handleApi(new Request("https://app.example/api/google/sync", { method: "POST", headers: { cookie: userCookie, origin: "https://app.example", "content-type": "application/json" }, body: JSON.stringify({ eventIds: ["task-never-sync"] }) }), env, {});
+    assert.equal(sync.status, 200);
+    assert.equal((await sync.json()).skippedTasks, 1);
+    assert.equal(outbound, 0);
+  } finally { globalThis.fetch = previousFetch; }
+});
+
+test("task completion updates are account-owned and task selection is skipped by calendar sync", async () => {
+  const db = fakeDb(), env = { DB: db, APP_SESSION_SECRET: secret };
+  db.allRows = [{ id: "task-toggle", user_id: "google-user-1", title: "Read", start: "2026-10-20T03:00:00.000Z", end: "2026-10-20T03:01:00.000Z", timezone: "Asia/Tokyo", recurrence: "[]", type: "task", due_date: "2026-10-20", due_time: null, completed: 0, google_event_id: null, synced_at: null }];
+  const update = await handleApi(new Request("https://app.example/api/events/task-toggle", { method: "PUT", headers: { cookie: await cookie(), origin: "https://app.example", "content-type": "application/json" }, body: JSON.stringify({ autoSync: true, event: { type: "task", title: "Read", dueDate: "2026-10-20", dueTime: null, timezone: "Asia/Tokyo", completed: true } }) }), env, {});
+  assert.equal(update.status, 200);
+  const updated = await update.json();
+  assert.equal(updated.event.completed, true);
+  assert.equal(updated.sync.status, "not-applicable");
+  assert.match(db.calls.at(-1).sql, /completed=COALESCE\(\?,completed\).*type=\?/);
+  assert.equal(db.calls.at(-1).args[7], 1);
+  assert.equal(db.calls.at(-1).args.at(-1), "task");
+  const sync = await handleApi(new Request("https://app.example/api/google/sync", { method: "POST", headers: { cookie: await cookie(), origin: "https://app.example", "content-type": "application/json" }, body: JSON.stringify({ eventIds: ["task-toggle"] }) }), env, {});
+  assert.equal(sync.status, 200);
+  const summary = await sync.json();
+  assert.equal(summary.skippedTasks, 1);
+  assert.equal(summary.created, 0);
+  assert.equal(summary.updated, 0);
+  assert.equal(summary.failed, 0);
+});
+
+test("GET events returns task fields and defaults legacy rows to schedules", async () => {
+  const db = fakeDb(), env = { DB: db, APP_SESSION_SECRET: secret };
+  db.allRows = [
+    { id: "task-read", user_id: "google-user-1", title: "Read", start: "2026-10-20T03:00:00.000Z", end: "2026-10-20T03:01:00.000Z", timezone: "Asia/Tokyo", recurrence: "[]", type: "task", due_date: "2026-10-20", due_time: null, completed: 1, google_event_id: null, synced_at: null },
+    { id: "old-schedule", user_id: "google-user-1", title: "Meeting", start: "2026-10-20T05:00:00.000Z", end: "2026-10-20T06:00:00.000Z", timezone: "Asia/Tokyo", recurrence: "[]", google_event_id: null, synced_at: null },
+  ];
+  const response = await handleApi(new Request("https://app.example/api/events", { headers: { cookie: await cookie() } }), env, {});
+  assert.equal(response.status, 200);
+  const events = (await response.json()).events;
+  assert.equal(events[0].type, "task");
+  assert.equal(events[0].dueDate, "2026-10-20");
+  assert.equal(events[0].dueTime, null);
+  assert.equal(events[0].completed, true);
+  assert.equal(events[1].type, "schedule");
+  assert.equal(events[1].completed, false);
+});
+
 test("autoSync reports a missing Google grant as a partial failure", async () => {
   const db = fakeDb(), env = { DB: db, APP_SESSION_SECRET: secret };
   const response = await handleApi(new Request("https://app.example/api/events", { method: "POST", headers: { cookie: await cookie(), origin: "https://app.example", "content-type": "application/json" }, body: JSON.stringify({ autoSync: true, event: { title: "Planning", start: "2026-10-18T12:00:00Z" } }) }), env, {});

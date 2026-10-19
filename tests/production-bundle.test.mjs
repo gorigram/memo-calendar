@@ -44,6 +44,8 @@ test("Wrangler production bundle serves a page whose embedded parser runs indepe
   assert.match(html, /<title>ゴレンダー — 予定メモ<\/title>/);
   assert.match(html, /id="googleRefreshButton"/);
   assert.match(html, /id="googleImportStatus"/);
+  assert.match(html, /id="taskMode"/);
+  assert.match(html, /id="scheduleMode"/);
   assert.doesNotMatch(html, />undefined<\/svg>/);
   const parserScript = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
   assert.ok(parserScript, "page contains the embedded parser script");
@@ -51,6 +53,13 @@ test("Wrangler production bundle serves a page whose embedded parser runs indepe
   const context = { window: {} };
   vm.runInNewContext(parserScript, context, { timeout: 1_000 });
   assert.equal(typeof context.window.michiParser, "function");
+  assert.equal(typeof context.window.michiTaskParser, "function");
+  const task = context.window.michiTaskParser("明日 申込書を出す", new Date("2026-10-18T00:00:00.000Z"), "Asia/Tokyo");
+  assert.equal(task.ok, true);
+  assert.equal(task.event.type, "task");
+  assert.equal(task.event.dueDate, "2026-10-19");
+  assert.equal(task.event.dueTime, null);
+  assert.equal(context.window.michiTaskParser("14時 申込書を出す", new Date("2026-10-18T00:00:00.000Z"), "Asia/Tokyo").reason, "missing-date");
   const parsed = context.window.michiParser(
     "明日 午後3時 セミナー 1時間半",
     new Date("2026-10-18T00:00:00.000Z"),

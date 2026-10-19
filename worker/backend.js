@@ -86,17 +86,62 @@ async function accessToken(sub, env) {
   return result.access_token;
 }
 function iso(value) { const d = new Date(value); return Number.isNaN(d.valueOf()) ? null : d.toISOString(); }
+function validDateOnly(value) {
+  if (typeof value !== "string") return false;
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!match) return false;
+  const year = Number(match[1]), month = Number(match[2]), day = Number(match[3]);
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const days = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  return month >= 1 && month <= 12 && day >= 1 && day <= days[month - 1];
+}
+function taskStartInstant(dueDate, dueTime, timezone) {
+  try {
+    const [year, month, day] = dueDate.split("-").map(Number), [hour, minute] = (dueTime || "12:00").split(":").map(Number);
+    const wallTime = Date.UTC(year, month - 1, day, hour, minute, 0);
+    let instant = wallTime;
+    const format = new Intl.DateTimeFormat("en-GB", { timeZone: timezone, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" });
+    const partsInZone = value => Object.fromEntries(format.formatToParts(new Date(value)).map(part => [part.type, part.value]));
+    for (let i = 0; i < 4; i++) {
+      const parts = partsInZone(instant), represented = Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day), Number(parts.hour), Number(parts.minute), Number(parts.second));
+      const adjustment = represented - wallTime;
+      if (!adjustment) break;
+      instant -= adjustment;
+    }
+    const resolved = partsInZone(instant);
+    if (Number(resolved.year) !== year || Number(resolved.month) !== month || Number(resolved.day) !== day || Number(resolved.hour) !== hour || Number(resolved.minute) !== minute) throw new Error("dueTime does not exist in the selected time zone");
+    return new Date(instant);
+  } catch (error) {
+    if (error.message === "dueTime does not exist in the selected time zone") throw error;
+    throw new Error("A valid IANA time zone is required for tasks");
+  }
+}
 function normalizeEvent(input) {
   if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("event must be an object");
   const title = typeof input.title === "string" ? input.title.trim().slice(0, 240) : "";
+  const type = input.type === undefined || input.type === "event" ? "schedule" : input.type;
+  if (type !== "schedule" && type !== "task") throw new Error("type must be schedule or task");
+  if (!title) throw new Error("title is required");
+  const id = typeof input.id === "string" && /^[\w-]{1,80}$/.test(input.id) ? input.id : crypto.randomUUID();
+  const timezone = typeof input.timezone === "string" && input.timezone.length < 80 ? input.timezone : "UTC";
+  if (type === "task") {
+    const dueDate = input.dueDate;
+    if (!validDateOnly(dueDate)) throw new Error("A valid dueDate is required for tasks");
+    const dueTime = input.dueTime === null || input.dueTime === undefined || input.dueTime === "" ? null : input.dueTime;
+    if (dueTime !== null && (typeof dueTime !== "string" || !/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(dueTime))) throw new Error("dueTime must use 24-hour HH:mm format");
+    if (input.completed !== undefined && typeof input.completed !== "boolean") throw new Error("completed must be a boolean");
+    const canonicalStart = taskStartInstant(dueDate, dueTime, timezone);
+    return { id, title, type, dueDate, dueTime, completed: input.completed === true, start: canonicalStart.toISOString(), end: new Date(canonicalStart.getTime() + 60_000).toISOString(), timezone, recurrence: [] };
+  }
   const start = iso(input.start), end = iso(input.end);
-  if (!title) throw new Error("title is required"); if (!start) throw new Error("a valid start time is required");
+  if (!start) throw new Error("a valid start time is required");
   if (input.end && !end) throw new Error("end must be a valid date-time");
   if (end && Date.parse(end) <= Date.parse(start)) throw new Error("end must be after start");
   const recurrence = Array.isArray(input.recurrence) ? input.recurrence.filter(x => typeof x === "string" && /^RRULE:FREQ=(DAILY|WEEKLY|MONTHLY|YEARLY)(;.*)?$/.test(x)).slice(0, 1) : [];
-  return { id: typeof input.id === "string" && /^[\w-]{1,80}$/.test(input.id) ? input.id : crypto.randomUUID(), title, start, end: end || new Date(Date.parse(start) + 3600000).toISOString(), timezone: typeof input.timezone === "string" && input.timezone.length < 80 ? input.timezone : "UTC", recurrence };
+  return { id, title, type, start, end: end || new Date(Date.parse(start) + 3600000).toISOString(), timezone, recurrence, dueDate: null, dueTime: null, completed: false };
 }
-async function getEvents(sub, env) { return (await db(env).prepare("SELECT id,title,start,end,timezone,recurrence,google_event_id,synced_at,created_at,updated_at FROM events WHERE user_id = ? ORDER BY start").bind(sub).all()).results.map(row => ({ ...row, recurrence: JSON.parse(row.recurrence || "[]"), googleEventId: row.google_event_id, syncedAt: row.synced_at })); }
+function publicEventRow(row) { return { ...row, type: row.type || "schedule", dueDate: row.due_date || null, dueTime: row.due_time || null, completed: Boolean(row.completed), recurrence: JSON.parse(row.recurrence || "[]"), googleEventId: row.google_event_id, syncedAt: row.synced_at }; }
+async function getEvents(sub, env) { return (await db(env).prepare("SELECT id,title,start,end,timezone,recurrence,type,due_date,due_time,completed,google_event_id,synced_at,created_at,updated_at FROM events WHERE user_id = ? ORDER BY start").bind(sub).all()).results.map(publicEventRow); }
 async function parseMemo(request, env) {
   let body; try { body = await bodyJson(request); } catch (e) { return err(e.message); }
   if (typeof body.text !== "string" || !body.text.trim() || body.text.length > 5000) return err("text is required (maximum 5000 characters)");
@@ -160,6 +205,7 @@ async function oauthCallback(request, env) {
   return new Response(null, { status: 302, headers });
 }
 async function calendarEvent(sub, event, env) {
+  if (event.type === "task") throw new Error("Tasks are stored only in ゴレンダー and are not synced to Google Calendar");
   const token = await accessToken(sub, env), digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${sub}:${event.id}`))), id = [...digest].map(x => x.toString(16).padStart(2, "0")).join("").slice(0, 40);
   const payload = { id, summary: event.title, start: { dateTime: event.start, timeZone: event.timezone }, end: { dateTime: event.end, timeZone: event.timezone }, ...(event.recurrence.length ? { recurrence: event.recurrence } : {}), extendedProperties: { private: { memoCalendarId: event.id } } };
   let response = await apiFetch(`${CALENDAR}/calendars/primary/events/${id}`, token, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
@@ -169,6 +215,7 @@ async function calendarEvent(sub, event, env) {
   return id;
 }
 async function syncSavedEvent(sub, event, env) {
+  if (event.type === "task") return { status: "not-applicable" };
   try {
     const googleEventId = await calendarEvent(sub, event, env), syncedAt = new Date().toISOString();
     await db(env).prepare("UPDATE events SET google_event_id=?,synced_at=?,updated_at=? WHERE id=? AND user_id=?").bind(googleEventId, syncedAt, syncedAt, event.id, sub).run();
@@ -275,8 +322,10 @@ export async function handleApi(request, env, ctx) {
   if (path === "/api/google/sync" && request.method === "POST") {
     const sub = await userId(request, env); if (!sub) return err("Google sign-in required", 401);
     let body; try { body = await bodyJson(request); } catch (e) { return err(e.message); }
-    const events = await getEvents(sub, env), selected = Array.isArray(body.eventIds) ? new Set(body.eventIds) : null, results = { ok: true, created: 0, updated: 0, failed: 0, errors: [] };
-    for (const event of events.filter(e => !selected || selected.has(e.id))) { try { const gid = await calendarEvent(sub, event, env); const old = event.googleEventId; await db(env).prepare("UPDATE events SET google_event_id=?,synced_at=?,updated_at=? WHERE id=? AND user_id=?").bind(gid, new Date().toISOString(), new Date().toISOString(), event.id, sub).run(); results[old ? "updated" : "created"]++; } catch (e) { results.failed++; results.errors.push({ id: event.id, message: e.message }); } }
+    const events = await getEvents(sub, env), selected = Array.isArray(body.eventIds) ? new Set(body.eventIds) : null, results = { ok: true, created: 0, updated: 0, failed: 0, skippedTasks: 0, errors: [] };
+    const selectedEvents = events.filter(e => !selected || selected.has(e.id));
+    results.skippedTasks = selectedEvents.filter(e => e.type === "task").length;
+    for (const event of selectedEvents.filter(e => e.type !== "task")) { try { const gid = await calendarEvent(sub, event, env); const old = event.googleEventId; await db(env).prepare("UPDATE events SET google_event_id=?,synced_at=?,updated_at=? WHERE id=? AND user_id=?").bind(gid, new Date().toISOString(), new Date().toISOString(), event.id, sub).run(); results[old ? "updated" : "created"]++; } catch (e) { results.failed++; results.errors.push({ id: event.id, message: e.message }); } }
     results.ok = results.failed === 0;
     return json(results, results.failed ? 207 : 200);
   }
@@ -285,16 +334,19 @@ export async function handleApi(request, env, ctx) {
     if (path === "/api/events" && request.method === "GET") return json({ ok: true, events: await getEvents(sub, env) });
     if (path === "/api/events" && request.method === "POST") {
       let body, event; try { body = await bodyJson(request); event = normalizeEvent(body.event); } catch (e) { return err(e.message); }
-      const now = new Date().toISOString(); await db(env).prepare("INSERT INTO events (id,user_id,title,start,end,timezone,recurrence,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id,id) DO UPDATE SET title=excluded.title,start=excluded.start,end=excluded.end,timezone=excluded.timezone,recurrence=excluded.recurrence,google_event_id=NULL,synced_at=NULL,updated_at=excluded.updated_at").bind(event.id, sub, event.title, event.start, event.end, event.timezone, JSON.stringify(event.recurrence), now, now).run();
-      const sync = body.autoSync === true ? await syncSavedEvent(sub, event, env) : { status: "not-requested" };
+      const now = new Date().toISOString();
+      const saved = await db(env).prepare("INSERT INTO events (id,user_id,title,start,end,timezone,recurrence,type,due_date,due_time,completed,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id,id) DO UPDATE SET title=excluded.title,start=excluded.start,end=excluded.end,timezone=excluded.timezone,recurrence=excluded.recurrence,type=excluded.type,due_date=excluded.due_date,due_time=excluded.due_time,completed=excluded.completed,google_event_id=NULL,synced_at=NULL,updated_at=excluded.updated_at WHERE events.type=excluded.type").bind(event.id, sub, event.title, event.start, event.end, event.timezone, JSON.stringify(event.recurrence), event.type, event.dueDate, event.dueTime, Number(event.completed), now, now).run();
+      if (!saved.meta.changes) return err("An item cannot change between a schedule and a task.", 409);
+      const sync = event.type === "task" ? { status: "not-applicable" } : body.autoSync === true ? await syncSavedEvent(sub, event, env) : { status: "not-requested" };
       return json({ ok: sync.status !== "failed", event, sync }, sync.status === "failed" ? 207 : 201);
     }
     const id = decodeURIComponent(path.slice("/api/events/".length)); if (!/^[\w-]{1,80}$/.test(id)) return err("Invalid event id");
     if (request.method === "PUT") {
       let body, event; try { body = await bodyJson(request); event = normalizeEvent({ ...body.event, id }); } catch (e) { return err(e.message); }
-      const result = await db(env).prepare("UPDATE events SET title=?,start=?,end=?,timezone=?,recurrence=?,updated_at=? WHERE id=? AND user_id=?").bind(event.title, event.start, event.end, event.timezone, JSON.stringify(event.recurrence), new Date().toISOString(), id, sub).run();
+      const completedValue = body.event?.type === "task" && body.event.completed === undefined ? null : Number(event.completed);
+      const result = await db(env).prepare("UPDATE events SET title=?,start=?,end=?,timezone=?,recurrence=?,due_date=?,due_time=?,completed=COALESCE(?,completed),updated_at=? WHERE id=? AND user_id=? AND type=?").bind(event.title, event.start, event.end, event.timezone, JSON.stringify(event.recurrence), event.dueDate, event.dueTime, completedValue, new Date().toISOString(), id, sub, event.type).run();
       if (!result.meta.changes) return err("Event not found", 404);
-      const sync = body.autoSync === true ? await syncSavedEvent(sub, event, env) : { status: "not-requested" };
+      const sync = event.type === "task" ? { status: "not-applicable" } : body.autoSync === true ? await syncSavedEvent(sub, event, env) : { status: "not-requested" };
       return json({ ok: sync.status !== "failed", event, sync }, sync.status === "failed" ? 207 : 200);
     }
     if (request.method === "DELETE") {

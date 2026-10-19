@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseMemo } from '../worker/parser.js';
+import { parseMemo, parseTaskMemo } from '../worker/parser.js';
 
 const reference = new Date(2026, 9, 18, 9, 0, 0);
 
@@ -136,4 +136,38 @@ test('normalizes full-width memo text and parses dates followed by a weekday not
   assert.equal(slashDate.ok, true);
   assert.equal(slashDate.event.title, 'ゼミ');
   assert.equal(new Date(slashDate.event.start).getDate(), 20);
+});
+
+test('task parser requires an explicit real date and accepts optional due time', () => {
+  const missing = parseTaskMemo('14時 資料を提出', reference, 'Asia/Tokyo');
+  assert.equal(missing.ok, false);
+  assert.equal(missing.reason, 'missing-date');
+  const untimed = parseTaskMemo('明日 資料を提出', reference, 'Asia/Tokyo');
+  assert.equal(untimed.ok, true);
+  assert.equal(untimed.event.type, 'task');
+  assert.equal(untimed.event.dueDate, '2026-10-19');
+  assert.equal(untimed.event.dueTime, null);
+  assert.equal(untimed.event.title, '資料を提出');
+  const timed = parseTaskMemo('10/20(火) 午後3時までに申込書を送る', reference, 'Asia/Tokyo');
+  assert.equal(timed.ok, true);
+  assert.equal(timed.event.dueDate, '2026-10-20');
+  assert.equal(timed.event.dueTime, '15:00');
+  assert.equal(timed.event.title, '申込書を送る');
+});
+
+test('task parser preserves task and TODO wording in titles', () => {
+  const taskTitle = parseTaskMemo('明日 QAタスク検証', reference, 'Asia/Tokyo');
+  assert.equal(taskTitle.ok, true);
+  assert.equal(taskTitle.event.title, 'QAタスク検証');
+  const todoTitle = parseTaskMemo('明後日 TODO: タスクフォース資料', reference, 'Asia/Tokyo');
+  assert.equal(todoTitle.ok, true);
+  assert.equal(todoTitle.event.title, 'TODO: タスクフォース資料');
+});
+
+test('task parser rejects impossible and underspecified dates and embeds cleanly', () => {
+  assert.equal(parseTaskMemo('2月30日 書類', reference, 'Asia/Tokyo').reason, 'invalid-date');
+  assert.equal(parseTaskMemo('来週 書類', reference, 'Asia/Tokyo').reason, 'ambiguous-date');
+  assert.equal(parseTaskMemo('毎週火曜 書類', reference, 'Asia/Tokyo').reason, 'ambiguous-date');
+  const embedded = new Function('return (' + parseTaskMemo.toString() + ')')();
+  assert.equal(embedded('今日 17時 支払い', reference, 'Asia/Tokyo').event.dueDate, '2026-10-18');
 });
