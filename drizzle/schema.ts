@@ -1,4 +1,4 @@
-import { index, integer, primaryKey, sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { index, integer, primaryKey, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 export const oauthStates = sqliteTable("oauth_states", {
   stateHash: text("state_hash").primaryKey(),
@@ -35,3 +35,30 @@ export const events = sqliteTable("events", {
   primaryKey({ columns: [table.userId, table.id] }),
   index("events_by_user_start").on(table.userId, table.start),
 ]);
+
+export const eventTemplates = sqliteTable("event_templates", {
+  userId: text("user_id").notNull(),
+  id: text("id").notNull(),
+  shortcut: text("shortcut").notNull(),
+  title: text("title").notNull(),
+  time: text("time").notNull(),
+  durationMinutes: integer("duration_minutes").notNull().default(60),
+  recurrence: text("recurrence"),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+}, (table) => [
+  primaryKey({ columns: [table.userId, table.id] }),
+  uniqueIndex("event_templates_by_user_shortcut").on(table.userId, table.shortcut),
+]);
+
+export const eventBatches = sqliteTable("event_batches", {
+  userId: text("user_id").notNull(),
+  batchId: text("batch_id").notNull(),
+  requestHash: text("request_hash").notNull(),
+  claimNonce: text("claim_nonce").notNull(),
+  status: text("status").notNull(),
+  eventIdsJson: text("event_ids_json").notNull(),
+  syncJson: text("sync_json").notNull().default("[]"),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+}, (table) => [primaryKey({ columns: [table.userId, table.batchId] })]);

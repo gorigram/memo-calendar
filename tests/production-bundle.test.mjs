@@ -47,7 +47,17 @@ test("Wrangler production bundle serves a page whose embedded parser runs indepe
   assert.match(html, /id="taskMode"/);
   assert.match(html, /id="scheduleMode"/);
   assert.doesNotMatch(html, />undefined<\/svg>/);
-  const parserScript = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
+  const inlineScripts = Array.from(html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi))
+    .filter(([, attributes]) => !/\bsrc\s*=/.test(attributes))
+    .filter(([, attributes]) => {
+      const type = attributes.match(/\btype\s*=\s*["']?([^\s"'>]+)/i)?.[1]?.toLowerCase();
+      return !type || ["text/javascript", "application/javascript", "module"].includes(type);
+    });
+  assert.ok(inlineScripts.length >= 1, "page contains inline JavaScript");
+  for (const [index, [, , source]] of inlineScripts.entries()) {
+    assert.doesNotThrow(() => new vm.Script(source, { filename: `inline-client-${index + 1}.js` }), `inline script ${index + 1} compiles`);
+  }
+  const parserScript = inlineScripts[0]?.[2];
   assert.ok(parserScript, "page contains the embedded parser script");
 
   const context = { window: {} };
@@ -68,6 +78,24 @@ test("Wrangler production bundle serves a page whose embedded parser runs indepe
   assert.equal(parsed.ok, true);
   assert.equal(parsed.event.title, "セミナー");
   assert.equal(parsed.durationSpecified, true);
+  const weekdayBatch = context.window.michiParser(
+    "来週の火曜と水曜と土曜日に17時からバイト",
+    new Date("2026-10-21T02:00:00.000Z"),
+    "Asia/Tokyo",
+  );
+  assert.deepEqual(Array.from(weekdayBatch.events.map(event => event.start)), [
+    "2026-10-27T08:00:00.000Z",
+    "2026-10-28T08:00:00.000Z",
+    "2026-10-31T08:00:00.000Z",
+  ]);
+  const template = context.window.michiParser(
+    "来週火曜①",
+    new Date("2026-10-21T02:00:00.000Z"),
+    "Asia/Tokyo",
+    [{ id: "work", shortcut: "①", title: "バイト", time: "17:00", durationMinutes: 60 }],
+  );
+  assert.equal(template.event.title, "バイト");
+  assert.equal(template.event.start, "2026-10-27T08:00:00.000Z");
 
   const eventModel = context.window.michiEventModel;
   assert.equal(typeof eventModel?.normalizeRecurrence, "function");

@@ -15,6 +15,13 @@
       "when": 1792351068653,
       "tag": "0001_overconfident_toxin",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1792553045892,
+      "tag": "0002_pink_wiccan",
+      "breakpoints": true
     }
   ]
 }

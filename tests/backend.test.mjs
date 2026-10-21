@@ -12,10 +12,44 @@ async function cookie(sub = "google-user-1") {
   return `memo_session=${payload}.${signature}`;
 }
 function fakeDb() {
-  const rows = new Map(), states = new Map(), calls = [];
-  const db = { prepare(sql) { let args = []; return { bind(...values) { args = values; return this; }, async first() { if (sql.includes("google_tokens")) return rows.get(args[0]) || null; if (sql.includes("oauth_states")) return states.get(args[0]) || null; return null; }, async all() { if (sql.includes("SELECT id,title,start,end,timezone,recurrence,google_event_id FROM events")) return { results: db.appRows }; return { results: db.allRows }; }, async run() { calls.push({ sql, args }); if (sql.includes("INSERT INTO oauth_states")) states.set(args[0], { code_verifier: args[1], expires_at: args[2], owner_id: args[3] }); if (sql.includes("DELETE FROM oauth_states")) states.delete(args[0]); return { meta: { changes: 1 } }; } }; } };
+  const rows = new Map(), states = new Map(), templates = new Map(), batches = new Map(), persistedEvents = new Map(), calls = [];
+  const key = (owner, id) => `${owner}\0${id}`;
+  const db = { prepare(sql) { let args = []; return { sql, get args() { return args; }, bind(...values) { args = values; return this; }, async first() { if (sql.includes("google_tokens")) return rows.get(args[0]) || null; if (sql.includes("oauth_states")) return states.get(args[0]) || null; if (sql.includes("FROM event_batches")) return batches.get(key(args[0], args[1])) || null; return null; }, async all() { if (sql.includes("FROM event_templates")) return { results: [...templates.values()].filter(row => row.user_id === args[0]) }; if (sql.includes("SELECT id,title,start,end,timezone,recurrence,type,due_date")) { const found = [...persistedEvents.values()].filter(row => row.user_id === args[0]); return { results: found.length ? found : db.allRows }; } if (sql.includes("SELECT id,title,start,end,timezone,recurrence,google_event_id FROM events")) return { results: db.appRows }; return { results: db.allRows }; }, async run() { calls.push({ sql, args }); if (sql.includes("INSERT INTO oauth_states")) states.set(args[0], { code_verifier: args[1], expires_at: args[2], owner_id: args[3] }); if (sql.includes("DELETE FROM oauth_states")) states.delete(args[0]); if (sql.includes("UPDATE event_batches") && !db.failBatchReceipt) { const row = batches.get(key(args[3], args[4])); if (row && row.claim_nonce === args[5]) { row.status = args[0]; row.sync_json = args[1]; } } return { meta: { changes: 1 } }; } }; }, async batch(statements) {
+    const nextTemplates = new Map(templates), nextBatches = new Map([...batches].map(([k, v]) => [k, structuredClone(v)])), nextEvents = new Map([...persistedEvents].map(([k, v]) => [k, structuredClone(v)]));
+    const results = [];
+    for (const statement of statements) {
+      const { sql, args } = statement;
+      calls.push({ sql, args });
+      if (sql.startsWith("DELETE FROM event_templates")) {
+        for (const [k, row] of nextTemplates) if (row.user_id === args[0]) nextTemplates.delete(k);
+        results.push({ meta: { changes: 1 } });
+      } else if (sql.startsWith("INSERT INTO event_templates")) {
+        const row = { user_id: args[0], id: args[1], shortcut: args[2], title: args[3], time: args[4], duration_minutes: args[5], recurrence: args[6] };
+        nextTemplates.set(key(row.user_id, row.id), row); results.push({ meta: { changes: 1 } });
+      } else if (sql.startsWith("INSERT INTO event_batches")) {
+        const owner = args[0], batchId = args[1], batchKey = key(owner, batchId), eventIds = JSON.parse(args[5]);
+        const hasCollision = eventIds.some(id => nextEvents.has(key(owner, id)));
+        if (nextBatches.has(batchKey) || hasCollision) results.push({ meta: { changes: 0 } });
+        else { nextBatches.set(batchKey, { user_id: owner, batch_id: batchId, request_hash: args[2], claim_nonce: args[3], status: args[4], event_ids_json: args[5], sync_json: "[]" }); results.push({ meta: { changes: 1 } }); }
+      } else if (sql.startsWith("INSERT INTO events") && sql.includes("event_batches")) {
+        if (db.failBatchOnEvent) throw new Error("injected transaction failure");
+        const owner = args[1], batchKey = key(args[13], args[14]), batch = nextBatches.get(batchKey);
+        if (!batch || batch.claim_nonce !== args[15] || nextEvents.has(key(owner, args[0]))) results.push({ meta: { changes: 0 } });
+        else { nextEvents.set(key(owner, args[0]), { id: args[0], user_id: owner, title: args[2], start: args[3], end: args[4], timezone: args[5], recurrence: args[6], type: args[7], due_date: args[8], due_time: args[9], completed: args[10], google_event_id: null, synced_at: null }); results.push({ meta: { changes: 1 } }); }
+      } else throw new Error(`Unexpected fake D1 batch statement: ${sql}`);
+    }
+    templates.clear(); for (const entry of nextTemplates) templates.set(...entry);
+    batches.clear(); for (const entry of nextBatches) batches.set(...entry);
+    persistedEvents.clear(); for (const entry of nextEvents) persistedEvents.set(...entry);
+    return results;
+  } };
   db.rows = rows;
   db.states = states;
+  db.templates = templates;
+  db.batches = batches;
+  db.persistedEvents = persistedEvents;
+  db.failBatchOnEvent = false;
+  db.failBatchReceipt = false;
   db.calls = calls;
   db.allRows = [];
   db.appRows = [];
@@ -149,6 +183,134 @@ test("event creation gives an omitted end a one-hour default", async () => {
   const retry = await handleApi(new Request("https://app.example/api/events", { method: "POST", headers: { cookie: await cookie(), origin: "https://app.example", "content-type": "application/json" }, body: JSON.stringify({ event: { id: event.id, title: "Planning", start: event.start } }) }), env, {});
   assert.equal(retry.status, 201);
   assert.match(db.calls.at(-1).sql, /ON CONFLICT\(user_id,id\) DO UPDATE/);
+});
+
+test("saved templates are validated, account-scoped, and supplied to the server parser", async () => {
+  const db = fakeDb(), env = { DB: db, APP_SESSION_SECRET: secret, AI: { async run() { throw new Error("template expansion must not use AI"); } } };
+  const headers = { cookie: await cookie(), origin: "https://app.example", "content-type": "application/json" };
+  const templates = [
+    { id: "shift-17", shortcut: "①", title: "バイト", time: "17:00", durationMinutes: 240, recurrence: null },
+    { id: "shift-21", shortcut: "②", title: "バイト", time: "21:00", durationMinutes: 180, recurrence: null },
+  ];
+  const save = await handleApi(new Request("https://app.example/api/templates", { method: "PUT", headers, body: JSON.stringify({ templates }) }), env, {});
+  assert.equal(save.status, 200);
+  assert.deepEqual((await save.json()).templates, templates);
+  const invalid = await handleApi(new Request("https://app.example/api/templates", { method: "PUT", headers, body: JSON.stringify({ templates: [{ ...templates[0], time: "25:00" }] }) }), env, {});
+  assert.equal(invalid.status, 400);
+  assert.equal((await handleApi(new Request("https://app.example/api/templates"), env, {})).status, 401);
+  const otherUser = await handleApi(new Request("https://app.example/api/templates", { headers: { cookie: await cookie("another-user") } }), env, {});
+  assert.deepEqual((await otherUser.json()).templates, []);
+
+  const get = await handleApi(new Request("https://app.example/api/templates", { headers: { cookie: await cookie() } }), env, {});
+  assert.deepEqual((await get.json()).templates, templates);
+  const parse = await handleApi(new Request("https://app.example/api/parse", { method: "POST", headers, body: JSON.stringify({ text: "来週火曜①", timezone: "Asia/Tokyo" }) }), env, {});
+  const result = await parse.json();
+  assert.equal(result.mode, "rules");
+  assert.equal(result.events.length, 1);
+  assert.equal(result.event.title, "バイト");
+  assert.equal(result.event.start, result.events[0].start);
+  const parts = new Intl.DateTimeFormat("en-GB", { timeZone: "Asia/Tokyo", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).formatToParts(new Date(result.event.start));
+  assert.equal(`${parts.find(x => x.type === "hour").value}:${parts.find(x => x.type === "minute").value}`, "17:00");
+  const second = await handleApi(new Request("https://app.example/api/parse", { method: "POST", headers, body: JSON.stringify({ text: "来週火曜②", timezone: "Asia/Tokyo" }) }), env, {});
+  assert.equal((await second.json()).event.start.slice(11, 16), "12:00", "UTC representation of 21:00 JST is 12:00Z");
+});
+
+test("server parse preserves every weekday in a batch and does not send batches through AI", async () => {
+  let aiCalls = 0;
+  const env = { DB: fakeDb(), APP_SESSION_SECRET: secret, AI: { async run() { aiCalls++; return { response: "{}" }; } } };
+  const response = await handleApi(new Request("https://app.example/api/parse", { method: "POST", headers: { cookie: await cookie(), origin: "https://app.example", "content-type": "application/json" }, body: JSON.stringify({ text: "来週の火曜と水曜と土曜日に17時からバイト", timezone: "Asia/Tokyo" }) }), env, {});
+  const result = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(result.needsClarification, false);
+  assert.equal(result.mode, "rules");
+  assert.equal(result.events.length, 3);
+  assert.equal(result.event, undefined, "multi-event responses do not collapse to one legacy event");
+  assert.deepEqual(result.events.map(event => event.title), ["バイト", "バイト", "バイト"]);
+  assert.equal(new Set(result.events.map(event => event.start.slice(0, 10))).size, 3);
+  assert.equal(aiCalls, 0);
+});
+
+test("batch schedule creation is atomic and idempotent per account and payload", async () => {
+  const db = fakeDb(), env = { DB: db, APP_SESSION_SECRET: secret };
+  const headers = { cookie: await cookie(), origin: "https://app.example", "content-type": "application/json" };
+  const body = { batchId: "batch-20261021-1", autoSync: false, events: [
+    { id: "batch-tue", title: "バイト", start: "2026-10-27T08:00:00Z", end: "2026-10-27T12:00:00Z", timezone: "Asia/Tokyo" },
+    { id: "batch-wed", title: "バイト", start: "2026-10-28T08:00:00Z", end: "2026-10-28T12:00:00Z", timezone: "Asia/Tokyo" },
+    { id: "batch-sat", title: "バイト", start: "2026-10-31T08:00:00Z", end: "2026-10-31T12:00:00Z", timezone: "Asia/Tokyo" },
+  ] };
+  const created = await handleApi(new Request("https://app.example/api/events/batch", { method: "POST", headers, body: JSON.stringify(body) }), env, {});
+  assert.equal(created.status, 201);
+  const first = await created.json();
+  assert.equal(first.events.length, 3);
+  assert.equal(first.status, "complete");
+  assert.deepEqual(first.syncResults.map(item => item.status), ["not-requested", "not-requested", "not-requested"]);
+  assert.equal(db.persistedEvents.size, 3);
+
+  const replay = await handleApi(new Request("https://app.example/api/events/batch", { method: "POST", headers, body: JSON.stringify(body) }), env, {});
+  assert.equal(replay.status, 200);
+  assert.equal((await replay.json()).replayed, true);
+  assert.equal(db.persistedEvents.size, 3, "retries do not duplicate event rows");
+
+  const differentPayload = structuredClone(body); differentPayload.events[0].title = "Different";
+  const conflict = await handleApi(new Request("https://app.example/api/events/batch", { method: "POST", headers, body: JSON.stringify(differentPayload) }), env, {});
+  assert.equal(conflict.status, 409);
+  const otherAccount = await handleApi(new Request("https://app.example/api/events/batch", { method: "POST", headers: { ...headers, cookie: await cookie("another-user") }, body: JSON.stringify(body) }), env, {});
+  assert.equal(otherAccount.status, 201, "same ids in a different account are isolated by composite ownership keys");
+  assert.equal(db.persistedEvents.size, 6);
+  const colliding = await handleApi(new Request("https://app.example/api/events/batch", { method: "POST", headers, body: JSON.stringify({ batchId: "collision-batch", events: [
+    { id: "batch-tue", title: "Would overwrite", start: "2026-11-03T08:00:00Z" },
+    { id: "batch-extra", title: "Would partially save", start: "2026-11-04T08:00:00Z" },
+  ] }) }), env, {});
+  assert.equal(colliding.status, 409);
+  assert.equal(db.persistedEvents.size, 6, "a collision on one id prevents every write in the batch");
+});
+
+test("batch schedule writes reject task or duplicate ids and roll back completely on D1 failure", async () => {
+  const db = fakeDb(), env = { DB: db, APP_SESSION_SECRET: secret }, headers = { cookie: await cookie(), origin: "https://app.example", "content-type": "application/json" };
+  const event = (id) => ({ id, title: "Work", start: "2026-10-27T08:00:00Z", end: "2026-10-27T09:00:00Z", timezone: "Asia/Tokyo" });
+  for (const events of [[event("same"), event("same")], [{ ...event("task-in-batch"), type: "task" }]]) {
+    const response = await handleApi(new Request("https://app.example/api/events/batch", { method: "POST", headers, body: JSON.stringify({ batchId: "invalid-batch", events }) }), env, {});
+    assert.equal(response.status, 400);
+    assert.equal(db.persistedEvents.size, 0);
+  }
+  db.failBatchOnEvent = true;
+  const failed = await handleApi(new Request("https://app.example/api/events/batch", { method: "POST", headers, body: JSON.stringify({ batchId: "rollback-batch", events: [event("rollback-one"), event("rollback-two")] }) }), env, {});
+  assert.equal(failed.status, 409);
+  assert.equal(db.persistedEvents.size, 0);
+  assert.equal(db.batches.size, 0, "failed D1.batch rolls back the claim and all earlier event inserts");
+});
+
+test("a replay after a durable-save/receipt interruption returns saved events with unknown sync status", async () => {
+  const db = fakeDb(), env = { DB: db, APP_SESSION_SECRET: secret };
+  const headers = { cookie: await cookie(), origin: "https://app.example", "content-type": "application/json" };
+  const body = { batchId: "receipt-recovery", autoSync: true, events: [{ id: "receipt-shift", title: "バイト", start: "2026-10-27T08:00:00Z", end: "2026-10-27T09:00:00Z", timezone: "Asia/Tokyo" }] };
+  db.failBatchReceipt = true;
+  const first = await handleApi(new Request("https://app.example/api/events/batch", { method: "POST", headers, body: JSON.stringify(body) }), env, {});
+  assert.equal(first.status, 207, "the original response truthfully reports failed calendar sync");
+  assert.equal(db.batches.get("google-user-1\0receipt-recovery").status, "pending");
+  const retry = await handleApi(new Request("https://app.example/api/events/batch", { method: "POST", headers, body: JSON.stringify(body) }), env, {});
+  assert.equal(retry.status, 200);
+  const result = await retry.json();
+  assert.equal(result.replayed, true);
+  assert.equal(result.events.length, 1);
+  assert.equal(result.sync.status, "unknown");
+  assert.deepEqual(result.syncResults, [{ id: "receipt-shift", status: "unknown" }]);
+  assert.equal(db.persistedEvents.size, 1);
+});
+
+test("batch reports each Google failure and never claims a full sync", async () => {
+  const db = fakeDb(), env = { DB: db, APP_SESSION_SECRET: secret };
+  const headers = { cookie: await cookie(), origin: "https://app.example", "content-type": "application/json" };
+  const response = await handleApi(new Request("https://app.example/api/events/batch", { method: "POST", headers, body: JSON.stringify({ batchId: "sync-partial", autoSync: true, events: [
+    { id: "sync-one", title: "Shift 1", start: "2026-10-27T08:00:00Z", end: "2026-10-27T09:00:00Z" },
+    { id: "sync-two", title: "Shift 2", start: "2026-10-28T08:00:00Z", end: "2026-10-28T09:00:00Z" },
+  ] }) }), env, {});
+  assert.equal(response.status, 207);
+  const result = await response.json();
+  assert.equal(result.ok, false);
+  assert.equal(result.sync.status, "partial");
+  assert.deepEqual(result.syncResults.map(item => [item.id, item.status]), [["sync-one", "failed"], ["sync-two", "failed"]]);
+  assert.equal(result.events.length, 2, "D1 schedules are durable even when Google sync fails");
 });
 
 test("tasks require a real due date, accept optional 24-hour time, and never autosync to Google", async () => {

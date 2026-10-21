@@ -96,6 +96,67 @@ test('uses Monday as the week boundary for next-week weekdays', () => {
   assert.equal(new Date(result.event.start).getDate(), 20);
 });
 
+test('expands a shared time and title across every explicitly listed weekday', () => {
+  const now = new Date('2026-10-21T02:00:00.000Z');
+  const result = parseMemo('来週の火曜と水曜と土曜日に17時からバイト', now, 'Asia/Tokyo');
+  assert.equal(result.ok, true);
+  assert.equal(result.events.length, 3);
+  assert.equal(result.event, undefined);
+  assert.deepEqual(result.events.map(event => event.start), [
+    '2026-10-27T08:00:00.000Z',
+    '2026-10-28T08:00:00.000Z',
+    '2026-10-31T08:00:00.000Z',
+  ]);
+  assert.deepEqual(result.events.map(event => event.title), ['バイト', 'バイト', 'バイト']);
+  assert.ok(result.events.every(event => event.end === new Date(new Date(event.start).getTime() + 60 * 60 * 1000).toISOString()));
+});
+
+test('rejects an ambiguous multi-weekday phrase instead of creating a partial schedule', () => {
+  const now = new Date('2026-10-21T02:00:00.000Z');
+  const mixedWeeks = parseMemo('来週火曜と今週水曜17時 バイト', now, 'Asia/Tokyo');
+  assert.equal(mixedWeeks.ok, false);
+  assert.equal(mixedWeeks.reason, 'ambiguous-date');
+  const missingTime = parseMemo('来週の火曜と水曜 バイト', now, 'Asia/Tokyo');
+  assert.equal(missingTime.ok, false);
+  assert.equal(missingTime.reason, 'missing-time');
+  assert.equal(missingTime.events, undefined);
+});
+
+test('numbered schedule templates can supply a missing start time without weakening the time requirement', () => {
+  const now = new Date('2026-10-21T02:00:00.000Z');
+  const templates = [
+    { id: 'work-evening', shortcut: '①', title: 'バイト', time: '17:00', durationMinutes: 60, recurrence: null },
+    { id: 'work-night', shortcut: '②', title: 'バイト', time: '21:00', durationMinutes: 90, recurrence: null },
+  ];
+  const withoutTemplate = parseMemo('来週火曜', now, 'Asia/Tokyo');
+  assert.equal(withoutTemplate.ok, false);
+  assert.equal(withoutTemplate.reason, 'missing-time');
+  const first = parseMemo('来週火曜①', now, 'Asia/Tokyo', templates);
+  assert.equal(first.ok, true);
+  assert.equal(first.event.title, 'バイト');
+  assert.equal(first.event.start, '2026-10-27T08:00:00.000Z');
+  assert.equal(new Date(first.event.end) - new Date(first.event.start), 60 * 60 * 1000);
+  const second = parseMemo('来週火曜②', now, 'Asia/Tokyo', templates);
+  assert.equal(second.event.start, '2026-10-27T12:00:00.000Z');
+  assert.equal(new Date(second.event.end) - new Date(second.event.start), 90 * 60 * 1000);
+  const explicitOverride = parseMemo('来週火曜② 19時 バイト', now, 'Asia/Tokyo', templates);
+  assert.equal(explicitOverride.event.start, '2026-10-27T10:00:00.000Z');
+  assert.equal(new Date(explicitOverride.event.end) - new Date(explicitOverride.event.start), 90 * 60 * 1000);
+  assert.equal(parseMemo('来週火曜①②', now, 'Asia/Tokyo', templates).reason, 'ambiguous-template');
+  assert.equal(parseMemo('来週火曜⑳ 17時', now, 'Asia/Tokyo', templates).reason, 'unknown-template');
+  const batch = parseMemo('来週の火曜と水曜と土曜日に①', now, 'Asia/Tokyo', templates);
+  assert.equal(batch.ok, true);
+  assert.equal(batch.events.length, 3);
+  assert.ok(batch.events.every(event => event.title === 'バイト' && event.start.endsWith('T08:00:00.000Z')));
+  const remainingSlot = templates.filter(template => template.shortcut !== '①');
+  assert.equal(parseMemo('来週火曜①', now, 'Asia/Tokyo', remainingSlot).reason, 'unknown-template');
+  const editedSlot = remainingSlot.map(template => ({ ...template, time: '22:00', title: '夜勤', durationMinutes: 120 }));
+  const edited = parseMemo('来週火曜②', now, 'Asia/Tokyo', editedSlot);
+  assert.equal(edited.event.title, '夜勤');
+  assert.equal(edited.event.start, '2026-10-27T13:00:00.000Z');
+  assert.equal(new Date(edited.event.end) - new Date(edited.event.start), 2 * 60 * 60 * 1000);
+});
+
 test('accepts a valid overnight range and rejects an implausible reversed range', () => {
   const overnight = parseMemo('今日 23時から午前1時 仕事', reference);
   assert.equal(overnight.ok, true);
