@@ -199,6 +199,53 @@ test('normalizes full-width memo text and parses dates followed by a weekday not
   assert.equal(new Date(slashDate.event.start).getDate(), 20);
 });
 
+test('expands independent date-time pairs into an atomic list with one shared title', () => {
+  const now = new Date('2026-10-21T03:00:00.000Z');
+  for (const memo of [
+    '10/29 10:00と11/5 14:00 ワンキャリア',
+    '2026年10月29日10時と11月5日14時 ワンキャリア',
+    '１０／２９ １０：００と１１／５ １４：００ ワンキャリア',
+  ]) {
+    const result = parseMemo(memo, now, 'Asia/Tokyo');
+    assert.equal(result.ok, true, memo);
+    assert.equal(result.events.length, 2, memo);
+    assert.deepEqual(result.events.map(event => event.title), ['ワンキャリア', 'ワンキャリア']);
+    assert.deepEqual(result.events.map(event => event.start), [
+      '2026-10-29T01:00:00.000Z',
+      '2026-11-05T05:00:00.000Z',
+    ]);
+    assert.ok(result.events.every(event => new Date(event.end) - new Date(event.start) === 60 * 60 * 1000));
+  }
+
+  const yearBoundary = parseMemo('12/29 10:00と1/5 14:00 ワンキャリア', now, 'Asia/Tokyo');
+  assert.equal(yearBoundary.ok, true);
+  assert.deepEqual(yearBoundary.events.map(event => event.start), [
+    '2026-12-29T01:00:00.000Z',
+    '2027-01-05T05:00:00.000Z',
+  ]);
+  const reverseOrder = parseMemo('11/5 14:00と10/29 10:00 ワンキャリア', now, 'Asia/Tokyo');
+  assert.equal(reverseOrder.ok, true);
+  assert.deepEqual(reverseOrder.events.map(event => event.start), [
+    '2026-11-05T05:00:00.000Z',
+    '2026-10-29T01:00:00.000Z',
+  ]);
+});
+
+test('rejects incomplete or ambiguous date-time pairs without returning partial events', () => {
+  const now = new Date('2026-10-21T03:00:00.000Z');
+  for (const memo of [
+    '10/29 10:00と11/5 ワンキャリア',
+    '10/29 10:00と11/5 14:00と15:00 ワンキャリア',
+    '10/29 10:00と2/30 14:00 ワンキャリア',
+    '10/29 10:00と11/5 14:00と ワンキャリア',
+    '確認 10/29 10:00と11/5 14:00 ワンキャリア',
+  ]) {
+    const result = parseMemo(memo, now, 'Asia/Tokyo');
+    assert.equal(result.ok, false, memo);
+    assert.equal(result.events, undefined, memo);
+  }
+});
+
 test('task parser requires an explicit real date and accepts optional due time', () => {
   const missing = parseTaskMemo('14時 資料を提出', reference, 'Asia/Tokyo');
   assert.equal(missing.ok, false);

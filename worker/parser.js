@@ -46,6 +46,69 @@ export function parseMemo(text, now = new Date(), timeZone = Intl.DateTimeFormat
   const absolute = source.match(/(20\d{2})[年./-]\s*(\d{1,2})[月./-]\s*(\d{1,2})日?/);
   const monthDay = !absolute && source.match(/(\d{1,2})月\s*(\d{1,2})日/);
   const slashDay = !absolute && !monthDay && source.match(/(?:^|\s)(\d{1,2})[./](\d{1,2})(?:日)?(?:\s*\([日月火水木金土](?:曜)?\))?(?=\s|$)/);
+  // Do not require a digit boundary after 日: Japanese notes often join the
+  // clock directly (`10月29日10時`). Pair validation below rejects trailing
+  // numeric junk that is not a valid clock or separator.
+  const explicitDates = Array.from(source.matchAll(/(?<!\d)(?:(20\d{2})[年./-]\s*\d{1,2}[月./-]\s*\d{1,2}日?|\d{1,2}月\s*\d{1,2}日|\d{1,2}[./]\d{1,2}(?:日)?(?:\s*\([日月火水木金土](?:曜)?\))?)/g));
+  if (explicitDates.length > 1) {
+    if (template) return { ok: false, needsClarification: true, reason: 'ambiguous-template', message: '複数の日付をまとめる場合は、番号メモではなく各日付と時刻を入力してください。' };
+    if (weekdayBatch) return { ok: false, needsClarification: true, reason: 'ambiguous-date', message: '複数の日付指定があります。日付を1つの形式で入力してください。' };
+    if (explicitDates.length > 50) return { ok: false, needsClarification: true, reason: 'too-many-events', message: '一度に追加できる予定は50件までです。' };
+    if (source.slice(0, explicitDates[0].index).trim()) return { ok: false, needsClarification: true, reason: 'ambiguous-date-time-pair', message: '日付より前の内容を確認してください。各日付の後に時刻を入力してください。' };
+    const pairTimePattern = /(?:(午前|午後|朝|昼|夕方|夜)\s*(\d{1,2})(?:[:：](\d{1,2})|時(半|\d{1,2}分?)?)?|(?<!\d)(\d{1,2})[:：](\d{2})|(?<!\d)(\d{1,2})時(半|\d{1,2}分?)?)/g;
+    const pairTimes = Array.from(source.matchAll(pairTimePattern));
+    if (pairTimes.some(match => match.index < explicitDates[0].index)) return { ok: false, needsClarification: true, reason: 'ambiguous-time', message: '各日付の後に開始時刻を入力してください。' };
+    const parsedDates = [];
+    for (const match of explicitDates) {
+      const token = match[0], full = token.match(/^(20\d{2})[年./-]\s*(\d{1,2})[月./-]\s*(\d{1,2})日?/);
+      const jp = !full && token.match(/^(\d{1,2})月\s*(\d{1,2})日/);
+      const slash = !full && !jp && token.match(/^(\d{1,2})[./](\d{1,2})/);
+      if (!full && !jp && !slash) return { ok: false, needsClarification: true, reason: 'invalid-date', message: '日付を確認してください。' };
+      const month = Number(full ? full[2] : jp ? jp[1] : slash[1]);
+      const day = Number(full ? full[3] : jp ? jp[2] : slash[2]);
+      const explicitYear = full ? Number(full[1]) : null;
+      // Infer each year from the reference date rather than forcing memo order
+      // to be chronological; people often enter paired dates in reverse order.
+      let year = explicitYear || nowParts.year;
+      if (!explicitYear && nowParts.month >= 10 && month <= 3 && month < nowParts.month) year++;
+      const candidate = new Date(Date.UTC(year, month - 1, day));
+      if (candidate.getUTCFullYear() !== year || candidate.getUTCMonth() !== month - 1 || candidate.getUTCDate() !== day) return { ok: false, needsClarification: true, reason: 'invalid-date', message: '日付を確認してください。' };
+      const entry = { year, month, day, date: candidate };
+      parsedDates.push(entry);
+    }
+    const events = [];
+    let lastTimeEnd = 0;
+    for (let index = 0; index < explicitDates.length; index++) {
+      const dateMatch = explicitDates[index], dateEnd = dateMatch.index + dateMatch[0].length;
+      const nextDateStart = index + 1 < explicitDates.length ? explicitDates[index + 1].index : source.length;
+      const gap = source.slice(dateEnd, nextDateStart);
+      const timesInPair = pairTimes.filter(match => match.index >= dateEnd && match.index < nextDateStart);
+      if (!timesInPair.length) return { ok: false, needsClarification: true, reason: 'missing-time', message: 'すべての日付に開始時刻を入力してください。' };
+      if (timesInPair.length !== 1) return { ok: false, needsClarification: true, reason: 'ambiguous-time', message: '各日付に開始時刻を1つずつ入力してください。' };
+      const clock = timesInPair[0], beforeClock = source.slice(dateEnd, clock.index), afterClock = source.slice(clock.index + clock[0].length, nextDateStart);
+      if (!/^[\sの]*$/.test(beforeClock) || (index + 1 < explicitDates.length && !/^[\s、,。・と&＆からのに]*$/.test(afterClock))) return { ok: false, needsClarification: true, reason: 'ambiguous-date-time-pair', message: '各日付と時刻の組み合わせを確認してください。' };
+      let hour = Number(clock[2] || clock[5] || clock[7]), minute = Number(clock[3] || clock[6] || 0);
+      const suffix = clock[4] || clock[8] || '';
+      if (suffix.includes('半')) minute = 30;
+      const minuteSuffix = suffix.match(/(\d{1,2})分/); if (minuteSuffix) minute = Number(minuteSuffix[1]);
+      const meridiem = clock[1] || '';
+      if (['午後', '夕方', '夜'].includes(meridiem) && hour < 12) hour += 12;
+      else if (['午前', '朝'].includes(meridiem) && hour === 12) hour = 0;
+      else if (meridiem === '昼' && hour < 11) hour += 12;
+      if (hour > 23 || minute > 59) return { ok: false, needsClarification: true, reason: 'invalid-time', message: '時刻を確認してください。' };
+      const wallDate = new Date(parsedDates[index].date); wallDate.setUTCHours(hour, minute, 0, 0);
+      const start = instantFromWallDate(wallDate, timeZone);
+      events.push({ title: '', start: start.toISOString(), end: new Date(start.getTime() + 60 * 60000).toISOString(), recurrence: null, timezone: timeZone });
+      lastTimeEnd = clock.index + clock[0].length;
+    }
+    if (pairTimes.some(match => match.index >= lastTimeEnd)) return { ok: false, needsClarification: true, reason: 'ambiguous-time', message: '各日付に開始時刻を1つずつ入力してください。' };
+    const trailingMemo = source.slice(lastTimeEnd);
+    if (/^\s*(?:と|、|,|&|＆)(?:\s|$)/.test(trailingMemo)) return { ok: false, needsClarification: true, reason: 'ambiguous-date-time-pair', message: '最後の日付と時刻の後に続く内容を確認してください。' };
+    let title = trailingMemo.replace(/^[\s、,。・と&＆]*(?:から|開始|に)?[\s、,。・]*/, '').replace(/[、,。・\s]+$/g, '').trim();
+    if (!title) return { ok: false, needsClarification: true, reason: 'missing-title', message: '予定の名前を追加してください。' };
+    for (const event of events) event.title = title;
+    return { ok: true, mode: 'rules', durationSpecified: false, events };
+  }
   if (weekdayBatch && (absolute || monthDay || slashDay)) return { ok: false, needsClarification: true, reason: 'ambiguous-date', message: '複数の日付指定があります。日付を1つの形式で入力してください。' };
   if (absolute || monthDay || slashDay) {
     const m = absolute || monthDay || slashDay;

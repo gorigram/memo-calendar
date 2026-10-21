@@ -88,6 +88,23 @@ test("Wrangler production bundle serves a page whose embedded parser runs indepe
     "2026-10-28T08:00:00.000Z",
     "2026-10-31T08:00:00.000Z",
   ]);
+  const pairedDates = context.window.michiParser(
+    "10/29 10:00と11/5 14:00 ワンキャリア",
+    new Date("2026-10-21T03:00:00.000Z"),
+    "Asia/Tokyo",
+  );
+  assert.equal(pairedDates.ok, true);
+  assert.deepEqual(Array.from(pairedDates.events, event => [event.title, event.start, event.end]), [
+    ["ワンキャリア", "2026-10-29T01:00:00.000Z", "2026-10-29T02:00:00.000Z"],
+    ["ワンキャリア", "2026-11-05T05:00:00.000Z", "2026-11-05T06:00:00.000Z"],
+  ]);
+  const incompletePairs = context.window.michiParser(
+    "10/29 10:00と11/5 ワンキャリア",
+    new Date("2026-10-21T03:00:00.000Z"),
+    "Asia/Tokyo",
+  );
+  assert.equal(incompletePairs.ok, false);
+  assert.equal(incompletePairs.events, undefined);
   const template = context.window.michiParser(
     "来週火曜①",
     new Date("2026-10-21T02:00:00.000Z"),

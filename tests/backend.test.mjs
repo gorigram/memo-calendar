@@ -230,6 +230,57 @@ test("server parse preserves every weekday in a batch and does not send batches 
   assert.equal(aiCalls, 0);
 });
 
+test("server parse and atomic batch preserve two explicit date/time pairs with one shared title", async () => {
+  let aiCalls = 0;
+  const db = fakeDb(), env = { DB: db, APP_SESSION_SECRET: secret, AI: { async run() { aiCalls++; return { response: JSON.stringify({ title: "Collapsed AI result", start: "2026-10-29T01:00:00Z" }) }; } } };
+  const headers = { cookie: await cookie(), origin: "https://app.example", "content-type": "application/json" };
+  const parsedResponse = await handleApi(new Request("https://app.example/api/parse", {
+    method: "POST", headers,
+    body: JSON.stringify({ text: "10/29 10:00と11/5 14:00 ワンキャリア", timezone: "Asia/Tokyo" }),
+  }), env, {});
+  assert.equal(parsedResponse.status, 200);
+  const parsed = await parsedResponse.json();
+  assert.equal(parsed.needsClarification, false);
+  assert.equal(parsed.mode, "rules", "multi-date parse bypasses singleton AI title refinement");
+  assert.equal(parsed.events.length, 2);
+  assert.equal(parsed.event, undefined);
+  assert.deepEqual(parsed.events.map(event => event.title), ["ワンキャリア", "ワンキャリア"]);
+  assert.deepEqual(parsed.events.map(event => event.start), ["2026-10-29T01:00:00.000Z", "2026-11-05T05:00:00.000Z"]);
+  assert.deepEqual(parsed.events.map(event => event.end), ["2026-10-29T02:00:00.000Z", "2026-11-05T06:00:00.000Z"]);
+  assert.equal(aiCalls, 0, "AI cannot collapse two verified date/time pairs into one event");
+
+  const batchResponse = await handleApi(new Request("https://app.example/api/events/batch", {
+    method: "POST", headers,
+    body: JSON.stringify({ batchId: "onecareer-two-dates", events: parsed.events.map((event, index) => ({ ...event, id: `onecareer-${index + 1}` })), autoSync: false }),
+  }), env, {});
+  assert.equal(batchResponse.status, 201);
+  const saved = await batchResponse.json();
+  assert.deepEqual(saved.events.map(event => event.title), ["ワンキャリア", "ワンキャリア"]);
+  assert.deepEqual(saved.events.map(event => event.start), ["2026-10-29T01:00:00.000Z", "2026-11-05T05:00:00.000Z"]);
+  assert.deepEqual(saved.events.map(event => event.end), ["2026-10-29T02:00:00.000Z", "2026-11-05T06:00:00.000Z"]);
+  assert.equal(db.persistedEvents.size, 2);
+});
+
+test("an invalid second date pair cannot produce or persist a partial first schedule", async () => {
+  let aiCalls = 0;
+  const db = fakeDb(), env = { DB: db, APP_SESSION_SECRET: secret, AI: { async run() { aiCalls++; return { response: "{}" }; } } };
+  const headers = { cookie: await cookie(), origin: "https://app.example", "content-type": "application/json" };
+  const parsedResponse = await handleApi(new Request("https://app.example/api/parse", { method: "POST", headers, body: JSON.stringify({ text: "10/29 10:00と11/35 14:00 ワンキャリア", timezone: "Asia/Tokyo" }) }), env, {});
+  const parsed = await parsedResponse.json();
+  assert.equal(parsed.needsClarification, true);
+  assert.equal(parsed.event, undefined);
+  assert.equal(parsed.events, undefined);
+  assert.equal(aiCalls, 0);
+
+  const batch = await handleApi(new Request("https://app.example/api/events/batch", { method: "POST", headers, body: JSON.stringify({ batchId: "invalid-pair-batch", events: [
+    { id: "valid-first", title: "ワンキャリア", start: "2026-10-29T01:00:00Z" },
+    { id: "invalid-second", title: "ワンキャリア", start: "not-a-date" },
+  ] }) }), env, {});
+  assert.equal(batch.status, 400);
+  assert.equal(db.persistedEvents.size, 0);
+  assert.equal(db.batches.size, 0, "validation completes before the atomic D1 batch begins");
+});
+
 test("batch schedule creation is atomic and idempotent per account and payload", async () => {
   const db = fakeDb(), env = { DB: db, APP_SESSION_SECRET: secret };
   const headers = { cookie: await cookie(), origin: "https://app.example", "content-type": "application/json" };
