@@ -279,3 +279,109 @@ test('task parser rejects impossible and underspecified dates and embeds cleanly
   const embedded = new Function('return (' + parseTaskMemo.toString() + ')')();
   assert.equal(embedded('今日 17時 支払い', reference, 'Asia/Tokyo').event.dueDate, '2026-10-18');
 });
+
+test('parses newline schedules atomically and reports the invalid line without partial events', () => {
+  const now = new Date('2026-10-21T02:00:00Z');
+  const result = parseMemo('来週火 1100 打合せ\n来週水 1400 病院', now, 'Asia/Tokyo');
+  assert.equal(result.ok, true);
+  assert.equal(result.events.length, 2);
+  assert.deepEqual(result.events.map(event => [event.title, event.start]), [
+    ['打合せ', '2026-10-27T02:00:00.000Z'],
+    ['病院', '2026-10-28T05:00:00.000Z'],
+  ]);
+  const invalid = parseMemo('今日 1100 会議\n明日 1260 会議', now, 'Asia/Tokyo');
+  assert.equal(invalid.ok, false);
+  assert.equal(invalid.reason, 'invalid-time');
+  assert.match(invalid.message, /^行2:/);
+  assert.equal(invalid.events, undefined);
+  const tooMany = parseMemo(Array.from({ length: 51 }, () => '今日 1100 会議').join('\n'), now, 'Asia/Tokyo');
+  assert.equal(tooMany.ok, false);
+  assert.equal(tooMany.reason, 'too-many-events');
+  assert.match(tooMany.message, /^行51:/);
+});
+
+test('accepts strict four-digit HHmm clocks in schedules, date pairs, and optional task times', () => {
+  const now = new Date('2026-10-21T02:00:00Z');
+  for (const [memo, start] of [
+    ['今日 1100 会議', '2026-10-21T02:00:00.000Z'],
+    ['今日 0900 朝会', '2026-10-21T00:00:00.000Z'],
+    ['今日 ２３５９ 終業', '2026-10-21T14:59:00.000Z'],
+  ]) {
+    const result = parseMemo(memo, now, 'Asia/Tokyo');
+    assert.equal(result.ok, true, memo);
+    assert.equal(result.event.start, start, memo);
+  }
+  for (const memo of ['今日 2400 会議', '今日 1260 会議']) {
+    assert.equal(parseMemo(memo, now, 'Asia/Tokyo').reason, 'invalid-time', memo);
+  }
+  const ranged = parseMemo('明日1100から1230 会議', now, 'Asia/Tokyo');
+  assert.equal(ranged.ok, true);
+  assert.equal(ranged.event.title, '会議');
+  assert.equal(ranged.event.start, '2026-10-22T02:00:00.000Z');
+  assert.equal(ranged.event.end, '2026-10-22T03:30:00.000Z');
+  for (const memo of ['明日1100から1260 会議', '明日1100から2400 会議']) assert.equal(parseMemo(memo, now, 'Asia/Tokyo').reason, 'invalid-time', memo);
+  const pairs = parseMemo('11/3 1100と11/5 1400 会議', now, 'Asia/Tokyo');
+  assert.equal(pairs.ok, true);
+  assert.deepEqual(pairs.events.map(event => event.start), ['2026-11-03T02:00:00.000Z', '2026-11-05T05:00:00.000Z']);
+  const task = parseTaskMemo('11/5 1400までに申込書を出す', now, 'Asia/Tokyo');
+  assert.equal(task.ok, true);
+  assert.equal(task.event.dueTime, '14:00');
+  assert.equal(parseMemo('2026年10月20日 病院', now, 'Asia/Tokyo').reason, 'missing-time');
+  assert.equal(parseMemo('今日 14時 2026年度キックオフ', now, 'Asia/Tokyo').event.title, '2026年度キックオフ');
+});
+
+test('supports short kanji weekdays with Monday week boundaries and rejects weekday-word false positives', () => {
+  const now = new Date('2026-10-21T02:00:00Z'); // Wednesday in Tokyo
+  const days = ['月', '火', '水', '木', '金', '土', '日'];
+  const expected = {
+    '今週': ['2026-10-19', '2026-10-20', '2026-10-21', '2026-10-22', '2026-10-23', '2026-10-24', '2026-10-25'],
+    '来週': ['2026-10-26', '2026-10-27', '2026-10-28', '2026-10-29', '2026-10-30', '2026-10-31', '2026-11-01'],
+    '再来週': ['2026-11-02', '2026-11-03', '2026-11-04', '2026-11-05', '2026-11-06', '2026-11-07', '2026-11-08'],
+  };
+  for (const [qualifier, dates] of Object.entries(expected)) {
+    for (let index = 0; index < days.length; index++) {
+      const result = parseMemo(`${qualifier}${days[index]} 1100 会議`, now, 'Asia/Tokyo');
+      assert.equal(result.ok, true, `${qualifier}${days[index]}`);
+      assert.equal(result.event.start.slice(0, 10), dates[index]);
+    }
+  }
+  const bare = ['月', '火', '水', '木', '金', '土', '日'].map(day => parseMemo(`${day} 1100 会議`, now, 'Asia/Tokyo'));
+  assert.deepEqual(bare.map(result => result.event.start.slice(0, 10)), ['2026-10-26', '2026-10-27', '2026-10-21', '2026-10-22', '2026-10-23', '2026-10-24', '2026-10-25']);
+  assert.equal(parseMemo('来週火1100 会議', now, 'Asia/Tokyo').event.start, '2026-10-27T02:00:00.000Z');
+  assert.equal(parseMemo('火1100 会議', now, 'Asia/Tokyo').event.start, '2026-10-27T02:00:00.000Z');
+  assert.equal(parseMemo('月曜 1100 会議', now, 'Asia/Tokyo').reason, 'ambiguous-date');
+  for (const [memo, title] of [['水族館 1100 会議', '水族館 会議'], ['日用品 1100 買い物', '日用品 買い物']]) {
+    const result = parseMemo(memo, now, 'Asia/Tokyo');
+    assert.equal(result.ok, true, memo);
+    assert.equal(result.event.title, title);
+  }
+  const batch = parseMemo('来週の月と火と土 1100 会議', now, 'Asia/Tokyo');
+  assert.equal(batch.ok, true);
+  assert.deepEqual(batch.events.map(event => event.start.slice(0, 10)), ['2026-10-26', '2026-10-27', '2026-10-31']);
+  const compactBatch = parseMemo('来週月と火と土1100 会議', now, 'Asia/Tokyo');
+  assert.equal(compactBatch.ok, true);
+  assert.deepEqual(compactBatch.events.map(event => event.start.slice(0, 10)), ['2026-10-26', '2026-10-27', '2026-10-31']);
+});
+
+test('matches named and legacy template aliases before extracting clock digits', () => {
+  const now = new Date('2026-10-21T02:00:00Z');
+  const templates = [
+    { id: 'early', shortcut: 'バイト早番', title: 'アルバイト', time: '07:30', durationMinutes: 240, recurrence: 'weekly', aliases: ['①'] },
+    { id: 'late', shortcut: 'バイト17:00', title: 'アルバイト', time: '17:00', durationMinutes: 120, recurrence: null },
+  ];
+  for (const memo of ['来週火 バイト早番', '来週火①']) {
+    const result = parseMemo(memo, now, 'Asia/Tokyo', templates);
+    assert.equal(result.ok, true, memo);
+    assert.equal(result.event.title, 'アルバイト');
+    assert.equal(result.event.start, '2026-10-26T22:30:00.000Z');
+    assert.equal(result.event.end, '2026-10-27T02:30:00.000Z');
+    assert.equal(result.event.recurrence, 'weekly');
+  }
+  const late = parseMemo('来週火 バイト17:00', now, 'Asia/Tokyo', templates);
+  assert.equal(late.ok, true);
+  assert.equal(late.event.start, '2026-10-27T08:00:00.000Z');
+  assert.equal(parseMemo('来週火 バイト早番 バイト早番', now, 'Asia/Tokyo', templates).reason, 'ambiguous-template');
+  const mixedLines = parseMemo('来週火 バイト早番\n来週水 バイト17:00', now, 'Asia/Tokyo', templates);
+  assert.equal(mixedLines.ok, true);
+  assert.deepEqual(mixedLines.events.map(event => event.title), ['アルバイト', 'アルバイト']);
+});

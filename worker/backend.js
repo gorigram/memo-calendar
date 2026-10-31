@@ -146,33 +146,69 @@ const TEMPLATE_SHORTCUTS = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰�
 function normalizeTemplate(input) {
   if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("Each template must be an object");
   const id = typeof input.id === "string" && /^[\w-]{1,80}$/.test(input.id) ? input.id : "";
-  const shortcut = typeof input.shortcut === "string" ? input.shortcut : "";
+  const rawShortcut = typeof input.shortcut === "string" ? input.shortcut : "";
+  // Circled shortcuts remain valid for old clients and stored rows. New names
+  // are canonicalized before they are stored or compared.
+  const legacyShortcut = rawShortcut.length === 1 && TEMPLATE_SHORTCUTS.includes(rawShortcut);
+  if (!legacyShortcut && /[\p{Cc}\u2028\u2029]/u.test(rawShortcut)) throw new Error("Template shortcut must be a single-line name without control characters");
+  const shortcut = legacyShortcut
+    ? rawShortcut
+    : rawShortcut.normalize("NFKC").trim();
   const title = typeof input.title === "string" ? input.title.trim().slice(0, 240) : "";
   const time = typeof input.time === "string" ? input.time : "";
   const durationMinutes = input.durationMinutes === undefined ? 60 : input.durationMinutes;
   const recurrence = input.recurrence || null;
+  const aliases = Array.isArray(input.aliases) ? input.aliases.filter(value => typeof value === "string" && value.length === 1 && TEMPLATE_SHORTCUTS.includes(value)) : [];
   if (!id) throw new Error("Template id must be a stable 1–80 character identifier");
-  if (shortcut.length !== 1 || !TEMPLATE_SHORTCUTS.includes(shortcut)) throw new Error("Template shortcut must be a circled number from ① to ⑳");
+  if (TEMPLATE_SHORTCUTS.includes(shortcut) && shortcut.length === 1) {
+    // Legacy compatibility slot.
+  } else {
+    const length = Array.from(shortcut).length;
+    if (!length || length > 40) throw new Error("Template shortcut must be a name from 1 to 40 characters");
+    if (/[\p{Cc}\u2028\u2029]/u.test(shortcut)) throw new Error("Template shortcut must be a single-line name without control characters");
+  }
   if (!title) throw new Error("Template title is required");
   if (!/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(time)) throw new Error("Template time must use 24-hour HH:mm format");
   if (!Number.isInteger(durationMinutes) || durationMinutes < 5 || durationMinutes > 1440) throw new Error("Template durationMinutes must be between 5 and 1440");
   if (recurrence !== null && !["daily", "weekly", "monthly"].includes(recurrence)) throw new Error("Template recurrence must be daily, weekly, monthly, or null");
-  return { id, shortcut, title, time, durationMinutes, recurrence };
+  return { id, shortcut, title, time, durationMinutes, recurrence, ...(aliases.length ? { aliases } : {}) };
 }
-function publicTemplateRow(row) { return { id: row.id, shortcut: row.shortcut, title: row.title, time: row.time, durationMinutes: row.duration_minutes, recurrence: row.recurrence || null }; }
-async function getTemplates(sub, env) { return (await db(env).prepare("SELECT id,shortcut,title,time,duration_minutes,recurrence FROM event_templates WHERE user_id=? ORDER BY shortcut").bind(sub).all()).results.map(publicTemplateRow); }
+function publicTemplateRow(row, shortcut = row.shortcut, aliases = []) { return { id: row.id, shortcut, ...(aliases.length ? { aliases } : {}), title: row.title, time: row.time, durationMinutes: row.duration_minutes, recurrence: row.recurrence || null }; }
+function legacyTemplateBase(title, time) { return `${Array.from(String(title || "").normalize("NFKC").trim()).slice(0, 30).join("")}${time}`; }
+function publicTemplates(rows) {
+  const legacyRows = rows.filter(row => row.shortcut.length === 1 && TEMPLATE_SHORTCUTS.includes(row.shortcut));
+  const names = new Map(), used = new Set(rows.filter(row => !legacyRows.includes(row)).map(row => row.shortcut.normalize("NFKC").trim().toLowerCase()));
+  for (const row of [...legacyRows].sort((a, b) => a.id.localeCompare(b.id))) {
+    const base = legacyTemplateBase(row.title, row.time);
+    let candidate = base, suffix = 2;
+    while (used.has(candidate.normalize("NFKC").trim().toLowerCase())) candidate = `${base}（${suffix++}）`;
+    used.add(candidate.normalize("NFKC").trim().toLowerCase());
+    names.set(row, candidate);
+  }
+  return rows.map(row => {
+    const legacy = names.has(row);
+    return publicTemplateRow(row, legacy ? names.get(row) : row.shortcut, legacy ? [row.shortcut] : []);
+  });
+}
+async function getTemplates(sub, env) { return publicTemplates((await db(env).prepare("SELECT id,shortcut,title,time,duration_minutes,recurrence FROM event_templates WHERE user_id=? ORDER BY shortcut").bind(sub).all()).results); }
 async function putTemplates(request, env, sub) {
   let body; try { body = await bodyJson(request); } catch (e) { return err(e.message); }
   if (!Array.isArray(body.templates) || body.templates.length > 20) return err("templates must be an array containing at most 20 items");
   let templates;
   try { templates = body.templates.map(normalizeTemplate); } catch (e) { return err(e.message); }
-  if (new Set(templates.map(item => item.id)).size !== templates.length || new Set(templates.map(item => item.shortcut)).size !== templates.length) return err("Template ids and numbered shortcuts must be unique");
+  const normalizedNames = templates.map(item => item.shortcut.normalize("NFKC").trim().toLowerCase());
+  if (new Set(templates.map(item => item.id)).size !== templates.length || new Set(normalizedNames).size !== templates.length) return err("Template ids and names must be unique");
   if (typeof db(env).batch !== "function") return err("Atomic template storage is unavailable.", 503);
   const now = new Date().toISOString();
+  const storedTemplates = templates.map(item => {
+    const base = legacyTemplateBase(item.title, item.time);
+    const legacyAlias = item.aliases?.find(alias => item.shortcut === base || /^\(\d+\)$/.test(item.shortcut.slice(base.length)) && item.shortcut.startsWith(base));
+    return { ...item, shortcut: legacyAlias || item.shortcut };
+  });
   const statements = [db(env).prepare("DELETE FROM event_templates WHERE user_id=?").bind(sub)];
-  for (const item of templates) statements.push(db(env).prepare("INSERT INTO event_templates (user_id,id,shortcut,title,time,duration_minutes,recurrence,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)").bind(sub, item.id, item.shortcut, item.title, item.time, item.durationMinutes, item.recurrence, now, now));
+  for (const item of storedTemplates) statements.push(db(env).prepare("INSERT INTO event_templates (user_id,id,shortcut,title,time,duration_minutes,recurrence,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)").bind(sub, item.id, item.shortcut, item.title, item.time, item.durationMinutes, item.recurrence, now, now));
   try { await db(env).batch(statements); } catch (e) { return err(`Could not save templates: ${e.message}`, 409); }
-  return json({ ok: true, templates });
+  return json({ ok: true, templates: publicTemplates(storedTemplates.map(item => ({ ...item, duration_minutes: item.durationMinutes }))) });
 }
 async function batchEvents(request, env, sub) {
   let body; try { body = await bodyJson(request); } catch (e) { return err(e.message); }
@@ -233,10 +269,11 @@ async function parseMemo(request, env) {
     if (body.templates.length > 20) return err("templates must contain at most 20 items");
     try {
       templates = body.templates.map(normalizeTemplate);
-      if (new Set(templates.map(item => item.shortcut)).size !== templates.length) return err("Template shortcuts must be unique");
+      if (new Set(templates.map(item => item.shortcut.normalize("NFKC").trim().toLowerCase())).size !== templates.length) return err("Template names must be unique");
     } catch (e) { return err(e.message); }
   }
-  const usedTemplate = templates.some(template => text.includes(template.shortcut));
+  const normalizedText = text.normalize("NFKC").toLocaleLowerCase();
+  const usedTemplate = templates.some(template => [template.shortcut, ...(template.aliases || [])].some(value => normalizedText.includes(value.normalize("NFKC").toLowerCase())));
   const rulesFallback = () => {
     let parsed; try { parsed = parseWithRules(text, new Date(), timezone, templates); } catch { return json({ ok: true, needsClarification: true, reason: "Choose a valid time zone and add an explicit date and start time.", mode: "rules" }); }
     if (!parsed.ok || !Array.isArray(parsed.events) || !parsed.events.length || parsed.events.some(event => !event?.start)) return json({ ok: true, needsClarification: true, reason: parsed.message || "Add a date and start time.", mode: "rules" });

@@ -22,20 +22,59 @@ export function parseMemo(text, now = new Date(), timeZone = Intl.DateTimeFormat
     }
     return new Date(instant);
   }
+  function normalizeMemo(value) {
+    return String(value).replace(/[①-⑳]/g, token => String.fromCharCode(0xE000 + token.charCodeAt(0) - 0x2460)).normalize('NFKC').replace(/[\uE000-\uE013]/g, marker => String.fromCharCode(0x2460 + marker.charCodeAt(0) - 0xE000));
+  }
   const rawSource = String(text || '').trim();
-  const source = rawSource.normalize('NFKC').trim();
+  let source = normalizeMemo(rawSource).trim();
   if (!source) return { ok: false, needsClarification: true, reason: 'empty', message: '予定の内容を入力してください。' };
+  const lines = source.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  if (lines.length > 1) {
+    const events = [];
+    for (let index = 0; index < lines.length; index++) {
+      const result = parseMemo(lines[index], now, timeZone, templates);
+      if (!result.ok) return { ...result, message: `行${index + 1}: ${result.message || '予定の内容を確認してください。'}` };
+      events.push(...(result.events || (result.event ? [result.event] : [])));
+      if (events.length > 50) return { ok: false, needsClarification: true, reason: 'too-many-events', message: `行${index + 1}: 一度に追加できる予定は50件までです。` };
+    }
+    return { ok: true, mode: 'rules', durationSpecified: false, events, ...(events.length === 1 ? { event: events[0] } : {}) };
+  }
 
   const nowParts = partsInZone(now, timeZone);
   const date = new Date(Date.UTC(nowParts.year, nowParts.month - 1, nowParts.day, nowParts.hour, nowParts.minute));
   date.setUTCSeconds(0, 0);
   const weekdayMap = { '日曜日': 0, '日曜': 0, '月曜日': 1, '月曜': 1, '火曜日': 2, '火曜': 2, '水曜日': 3, '水曜': 3, '木曜日': 4, '木曜': 4, '金曜日': 5, '金曜': 5, '土曜日': 6, '土曜': 6 };
-  const templateMatches = (Array.isArray(templates) ? templates : []).filter(item => item && typeof item.shortcut === 'string' && item.shortcut && rawSource.includes(item.shortcut));
-  if (templateMatches.length > 1) return { ok: false, needsClarification: true, reason: 'ambiguous-template', message: '予定テンプレートを1つだけ指定してください。' };
-  const template = templateMatches[0] || null;
-  const weekdayBatch = source.match(/(今週|来週|再来週)の?\s*([日月火水木金土]曜(?:日)?(?:\s*(?:と|、|,|及び|&|＆)\s*[日月火水木金土]曜(?:日)?)*)/);
+  const weekdayIndex = { 日: 0, 月: 1, 火: 2, 水: 3, 木: 4, 金: 5, 土: 6 };
+  const qualifiedShortWeekday = source.match(/(今週|来週|再来週)の?([日月火水木金土])(?!曜|日|[一-龯々ぁ-んァ-ヶ])/);
+  const bareShortWeekday = source.match(/(?:^|\s)([日月火水木金土])(?=\s|[0-9]|$)(?!曜|日)/);
+  const templateList = Array.isArray(templates) ? templates.filter(item => item && typeof item.shortcut === 'string' && item.shortcut) : [];
+  const templateMatches = templateList.flatMap(item => {
+    const callingNames = [item.shortcut, ...(Array.isArray(item.aliases) ? item.aliases : [])].filter(value => typeof value === 'string' && value).map(normalizeMemo);
+    return callingNames.flatMap(shortcut => {
+      const matches = [];
+      let index = source.indexOf(shortcut);
+      while (index >= 0) {
+        // Prefer a whole calling name. A shorter alias contained in a longer name
+        // is not a second call; two separate matches remain an ambiguity.
+        const before = source[index - 1] || '';
+        const after = source[index + shortcut.length] || '';
+        const legacyNumber = /^[①-⑳]$/.test(shortcut);
+        const leftOk = legacyNumber || !before || /\s|[日月火水木金土曜]$/.test(before);
+        const rightOk = legacyNumber || !after || /\s|[0-9]/.test(after);
+        if (leftOk && rightOk) matches.push({ item, shortcut, index });
+        index = source.indexOf(shortcut, index + shortcut.length);
+      }
+      return matches;
+    });
+  });
+  const selectedTemplateMatches = templateMatches.filter(match => !templateMatches.some(other => other !== match && other.index === match.index && other.shortcut.length > match.shortcut.length));
+  if (selectedTemplateMatches.length > 1) return { ok: false, needsClarification: true, reason: 'ambiguous-template', message: '予定テンプレートを1つだけ指定してください。' };
+  const selectedTemplate = selectedTemplateMatches[0] || null;
+  const template = selectedTemplate?.item || null;
+  if (selectedTemplate) source = source.slice(0, selectedTemplate.index) + ' ' + source.slice(selectedTemplate.index + selectedTemplate.shortcut.length);
+  const weekdayBatch = source.match(/(今週|来週|再来週)の?\s*([日月火水木金土](?:曜(?:日)?|(?=\s|[0-9]|と|、|,|及び|&|＆|$|に|は|の))(?:\s*(?:と|、|,|及び|&|＆)\s*[日月火水木金土](?:曜(?:日)?|(?=\s|[0-9]|と|、|,|及び|&|＆|$|に|は|の)))*)/);
   const weekdayMentions = Array.from(source.matchAll(/[日月火水木金土]曜(?:日)?/g));
-  const batchWeekdayCount = weekdayBatch ? Array.from(weekdayBatch[2].matchAll(/[日月火水木金土]曜(?:日)?/g)).length : 0;
+  const batchWeekdayCount = weekdayBatch ? Array.from(weekdayBatch[2].matchAll(/[日月火水木金土](?:曜(?:日)?)?/g)).length : 0;
   if (weekdayMentions.length > 1 && (!weekdayBatch || weekdayMentions.length !== batchWeekdayCount)) return { ok: false, needsClarification: true, reason: 'ambiguous-date', message: '複数の曜日を含む場合は、日付の範囲を確認してください。' };
   const shortcutTokens = Array.from(rawSource.matchAll(/[①-⑳]/g));
   if (shortcutTokens.length > 1) return { ok: false, needsClarification: true, reason: 'ambiguous-template', message: '予定テンプレートを1つだけ指定してください。' };
@@ -55,7 +94,7 @@ export function parseMemo(text, now = new Date(), timeZone = Intl.DateTimeFormat
     if (weekdayBatch) return { ok: false, needsClarification: true, reason: 'ambiguous-date', message: '複数の日付指定があります。日付を1つの形式で入力してください。' };
     if (explicitDates.length > 50) return { ok: false, needsClarification: true, reason: 'too-many-events', message: '一度に追加できる予定は50件までです。' };
     if (source.slice(0, explicitDates[0].index).trim()) return { ok: false, needsClarification: true, reason: 'ambiguous-date-time-pair', message: '日付より前の内容を確認してください。各日付の後に時刻を入力してください。' };
-    const pairTimePattern = /(?:(午前|午後|朝|昼|夕方|夜)\s*(\d{1,2})(?:[:：](\d{1,2})|時(半|\d{1,2}分?)?)?|(?<!\d)(\d{1,2})[:：](\d{2})|(?<!\d)(\d{1,2})時(半|\d{1,2}分?)?)/g;
+    const pairTimePattern = /(?:(午前|午後|朝|昼|夕方|夜)\s*(\d{1,2})(?:[:：](\d{1,2})|時(半|\d{1,2}分?)?)?|(?<!\d)(\d{1,2})[:：](\d{2})|(?<!\d)(\d{1,2})時(半|\d{1,2}分?)?|(?<![^\s日月火水木金土曜)])([0-9]{4})(?![0-9年月./-]))/g;
     const pairTimes = Array.from(source.matchAll(pairTimePattern));
     if (pairTimes.some(match => match.index < explicitDates[0].index)) return { ok: false, needsClarification: true, reason: 'ambiguous-time', message: '各日付の後に開始時刻を入力してください。' };
     const parsedDates = [];
@@ -87,7 +126,8 @@ export function parseMemo(text, now = new Date(), timeZone = Intl.DateTimeFormat
       if (timesInPair.length !== 1) return { ok: false, needsClarification: true, reason: 'ambiguous-time', message: '各日付に開始時刻を1つずつ入力してください。' };
       const clock = timesInPair[0], beforeClock = source.slice(dateEnd, clock.index), afterClock = source.slice(clock.index + clock[0].length, nextDateStart);
       if (!/^[\sの]*$/.test(beforeClock) || (index + 1 < explicitDates.length && !/^[\s、,。・と&＆からのに]*$/.test(afterClock))) return { ok: false, needsClarification: true, reason: 'ambiguous-date-time-pair', message: '各日付と時刻の組み合わせを確認してください。' };
-      let hour = Number(clock[2] || clock[5] || clock[7]), minute = Number(clock[3] || clock[6] || 0);
+      let hour = Number(clock[2] || clock[5] || clock[7] || clock[9]?.slice(0, 2)), minute = Number(clock[3] || clock[6] || 0);
+      if (clock[9]) minute = Number(clock[9].slice(2));
       const suffix = clock[4] || clock[8] || '';
       if (suffix.includes('半')) minute = 30;
       const minuteSuffix = suffix.match(/(\d{1,2})分/); if (minuteSuffix) minute = Number(minuteSuffix[1]);
@@ -133,16 +173,17 @@ export function parseMemo(text, now = new Date(), timeZone = Intl.DateTimeFormat
       else if (token === '明後日' || token === 'あさって') date.setUTCDate(date.getUTCDate() + 2);
       else if (token === '来週' || token === '再来週' || token === '今週') {
         const weekdayText = source.match(/(?:日|月|火|水|木|金|土)曜(?:日)?/);
-        if (!weekdayText) return { ok: false, needsClarification: true, reason: 'ambiguous-date', message: '曜日を指定してください。例: 来週の火曜' };
-        const target = weekdayMap[weekdayText[0]];
+        const shortDay = qualifiedShortWeekday && qualifiedShortWeekday[1] === token ? qualifiedShortWeekday[2] : (weekdayBatch && weekdayBatch[1] === token ? weekdayBatch[2].match(/[日月火水木金土]/)?.[0] || '' : '');
+        if (!weekdayText && !shortDay) return { ok: false, needsClarification: true, reason: 'ambiguous-date', message: '曜日を指定してください。例: 来週の火曜' };
+        const target = shortDay ? weekdayIndex[shortDay] : weekdayMap[weekdayText[0]];
         const addWeeks = token === '来週' ? 1 : token === '再来週' ? 2 : 0;
         const currentWeekday = (date.getUTCDay() + 6) % 7;
         const targetWeekday = (target + 6) % 7;
         let delta = targetWeekday - currentWeekday + addWeeks * 7;
         date.setUTCDate(date.getUTCDate() + delta);
         if (weekdayBatch && weekdayBatch[1] === token) {
-          const dayNames = Array.from(weekdayBatch[2].matchAll(/([日月火水木金土])曜(日)?/g), match => match[1] + (match[2] ? '曜日' : '曜'));
-          const weekdays = dayNames.map(name => weekdayMap[name]);
+          const dayNames = Array.from(weekdayBatch[2].matchAll(/([日月火水木金土])(?:曜(?:日)?)?/g), match => match[1]);
+          const weekdays = dayNames.map(name => weekdayIndex[name]);
           if (new Set(weekdays).size !== weekdays.length) return { ok: false, needsClarification: true, reason: 'duplicate-weekday', message: '同じ曜日が重複しています。日付を確認してください。' };
           batchDates = weekdays.map(weekday => {
             const candidate = new Date(Date.UTC(nowParts.year, nowParts.month - 1, nowParts.day));
@@ -152,7 +193,7 @@ export function parseMemo(text, now = new Date(), timeZone = Intl.DateTimeFormat
           });
           date.setTime(batchDates[0].getTime());
           dateToken = weekdayBatch[0];
-        } else dateToken = token + 'の' + weekdayText[0];
+        } else dateToken = shortDay ? qualifiedShortWeekday[0] : token + 'の' + weekdayText[0];
       } else if (token === '今月' || token === '来月') {
         const dayOfMonth = source.match(/(?:今月|来月)\s*(\d{1,2})日/);
         if (!dayOfMonth) return { ok: false, needsClarification: true, reason: 'ambiguous-date', message: '日付を指定してください。例: 来月15日' };
@@ -178,19 +219,26 @@ export function parseMemo(text, now = new Date(), timeZone = Intl.DateTimeFormat
         date.setUTCDate(date.getUTCDate() + delta);
         dateFound = true;
         dateToken = weekdayText[0];
+      } else if (bareShortWeekday) {
+        const weekday = weekdayIndex[bareShortWeekday[1]];
+        const delta = (weekday - date.getUTCDay() + 7) % 7;
+        date.setUTCDate(date.getUTCDate() + delta);
+        dateFound = true;
+        dateToken = bareShortWeekday[1];
       }
     }
   }
   // An omitted date means today; a vague date never silently becomes a different day.
 
-  const timeMatch = source.match(/(?:(午前|午後|朝|昼|夕方|夜)\s*(\d{1,2})(?:[:：](\d{1,2})|時(半|\d{1,2}分?)?)?|(?<!\d)(\d{1,2})[:：](\d{2})|(?<!\d)(\d{1,2})時(半|\d{1,2}分?)?)/);
+  const timeMatch = source.match(/(?:(午前|午後|朝|昼|夕方|夜)\s*(\d{1,2})(?:[:：](\d{1,2})|時(半|\d{1,2}分?)?)?|(?<!\d)(\d{1,2})[:：](\d{2})|(?<!\d)(\d{1,2})時(半|\d{1,2}分?)?|(?<![^\s日月火水木金土曜)])([0-9]{4})(?![0-9年月./-]))/);
   let meridiem = '', hour, minute = 0;
   const savedDuration = Number(template?.durationMinutes);
   let durationMinutes = Number.isFinite(savedDuration) && savedDuration >= 5 && savedDuration <= 1440 ? savedDuration : 60;
   let durationSpecified = Number.isFinite(savedDuration) && savedDuration >= 5 && savedDuration <= 1440;
   if (timeMatch) {
-    hour = Number(timeMatch[2] || timeMatch[5] || timeMatch[7]);
+    hour = Number(timeMatch[2] || timeMatch[5] || timeMatch[7] || timeMatch[9]?.slice(0, 2));
     minute = Number(timeMatch[3] || timeMatch[6] || 0);
+    if (timeMatch[9]) minute = Number(timeMatch[9].slice(2));
     meridiem = timeMatch[1] || '';
     const halfHour = (timeMatch[4] || timeMatch[8] || '').includes('半');
     if (halfHour) minute = 30;
@@ -212,14 +260,16 @@ export function parseMemo(text, now = new Date(), timeZone = Intl.DateTimeFormat
   const duration = durationSource.match(/(?:所要時間|約)?\s*(\d+)\s*(時間|分)(半)?(?:ほど|くらい|程度)?/);
   if (duration) { durationSpecified = true; durationMinutes = Number(duration[1]) * (duration[2] === '時間' ? 60 : 1) + (duration[3] && duration[2] === '時間' ? 30 : 0); }
   else {
-    const range = durationSource.match(/(?:から|〜|～|－|—)\s*(午前|午後|夕方|夜|昼|朝)?\s*(\d{1,2})(?::(\d{2})|時(半|\d{1,2}分?)?)?/);
+    const range = durationSource.match(/(?:から|〜|～|－|—)\s*(午前|午後|夕方|夜|昼|朝)?\s*(?:([0-9]{4})(?![0-9年月./-])|(\d{1,2})(?::(\d{2})|時(半|\d{1,2}分?)?)?)/);
     if (range) {
       durationSpecified = true;
-      let endHour = Number(range[2]);
+      let endHour = Number(range[2] ? range[2].slice(0, 2) : range[3]);
+      let endMinute = Number(range[2] ? range[2].slice(2) : range[4] || (range[5] === '半' ? 30 : (range[5] || '').match(/(\d{1,2})分/)?.[1]) || 0);
       if (range[1] === '午後' || range[1] === '夕方' || range[1] === '夜') { if (endHour < 12) endHour += 12; }
       else if ((range[1] === '午前' || range[1] === '朝') && endHour === 12) endHour = 0;
       else if (range[1] === '昼' && endHour < 11) endHour += 12;
-      const endMinute = Number(range[3] || (range[4] === '半' ? 30 : (range[4] || '').match(/(\d{1,2})分/)?.[1]) || 0);
+      endMinute = Number(endMinute);
+      if (endHour > 23 || endMinute > 59) return { ok: false, needsClarification: true, reason: 'invalid-time', message: '時刻を確認してください。' };
       let end = new Date(date);
       end.setUTCHours(endHour, endMinute, 0, 0);
       durationMinutes = Math.round((end - date) / 60000);
@@ -238,12 +288,13 @@ export function parseMemo(text, now = new Date(), timeZone = Intl.DateTimeFormat
     .replace(/\d{1,2}月\s*\d{1,2}日|(?:^|\s)\d{1,2}[./]\d{1,2}(?:日)?(?:\s*\([日月火水木金土](?:曜)?\))?(?=\s|$)/g, ' ')
     .replace(/(?:今日|本日|明日|あした|明後日|あさって|今週|来週|再来週|今月|来月)/g, '')
     .replace(/(?:日|月|火|水|木|金|土)曜(?:日)?/g, '')
+    .replace(/(?:今週|来週|再来週)の?[日月火水木金土](?!曜|日|[一-龯々ぁ-んァ-ヶ])|(?:^|\s)[日月火水木金土](?=\s|[0-9]|$)/g, ' ')
     .replace(timeMatch?.[0] || /$^/, '')
     .replace(/(?:所要時間|約)?\s*\d+\s*(?:時間|分)(?:半)?(?:ほど|くらい|程度)?/g, '')
-    .replace(/(?:から|〜|～|-|所要時間)\s*(?:\d+\s*(?:時間|分)(?:半)?|(?:午後|午前)?\s*\d{1,2}(?::\d{2})?\s*(?:時)?(?:分)?)(?:ほど|くらい|程度)?/g, '')
+    .replace(/(?:から|〜|～|-|所要時間)\s*(?:\d+\s*(?:時間|分)(?:半)?|(?:午後|午前)?\s*(?:[0-9]{4}(?![0-9年月./-])|\d{1,2}(?::\d{2})?\s*(?:時)?(?:分)?))(?:ほど|くらい|程度)?/g, '')
     .replace(/毎週|毎日|毎月|繰り返し/g, '')
     .replace(/^\s*(?:(?:に|から|より|の)\s*)+/, '')
-    .replace(/[、,。・\s]+$/g, '').replace(/^[、,。・\s]+/g, '').trim();
+    .replace(/[、,。・\s]+$/g, '').replace(/^[、,。・\s]+/g, '').replace(/\s+/g, ' ').trim();
   const title = template ? String(template.title || '').trim() : parsedTitle;
   if (!title) return { ok: false, needsClarification: true, reason: 'missing-title', message: '予定の名前を追加してください。' };
   const recurrence = /毎週/.test(source) ? 'weekly' : /毎日/.test(source) ? 'daily' : /毎月/.test(source) ? 'monthly' : (template?.recurrence || null);
@@ -279,6 +330,9 @@ export function parseTaskMemo(text, now = new Date(), timeZone = Intl.DateTimeFo
   const nowParts = partsInZone(now, timeZone);
   const date = new Date(Date.UTC(nowParts.year, nowParts.month - 1, nowParts.day, 12, 0, 0));
   const weekdayMap = { '日曜': 0, '日曜日': 0, '月曜': 1, '月曜日': 1, '火曜': 2, '火曜日': 2, '水曜': 3, '水曜日': 3, '木曜': 4, '木曜日': 4, '金曜': 5, '金曜日': 5, '土曜': 6, '土曜日': 6 };
+  const weekdayIndex = { 日: 0, 月: 1, 火: 2, 水: 3, 木: 4, 金: 5, 土: 6 };
+  const qualifiedShortWeekday = source.match(/(今週|来週|再来週)の?([日月火水木金土])(?!曜|日|[一-龯々ぁ-んァ-ヶ])/);
+  const bareShortWeekday = source.match(/(?:^|\s)([日月火水木金土])(?=\s|[0-9]|$)(?!曜|日)/);
   let dateToken = '';
   const absolute = source.match(/(20\d{2})[年./-]\s*(\d{1,2})[月./-]\s*(\d{1,2})日?/);
   const monthDay = !absolute && source.match(/(\d{1,2})月\s*(\d{1,2})日/);
@@ -298,10 +352,11 @@ export function parseTaskMemo(text, now = new Date(), timeZone = Intl.DateTimeFo
       else if (/^(明後日|あさって)$/.test(token)) date.setUTCDate(date.getUTCDate() + 2);
       else if (/^(今週|来週|再来週)$/.test(token)) {
         const weekdayText = source.match(/(?:日|月|火|水|木|金|土)曜(?:日)?/);
-        if (!weekdayText) return { ok: false, reason: 'ambiguous-date', message: '曜日を指定してください。例: 来週の火曜' };
-        const weekday = weekdayMap[weekdayText[0]]; const addWeeks = token === '来週' ? 1 : token === '再来週' ? 2 : 0;
+        const shortDay = qualifiedShortWeekday && qualifiedShortWeekday[1] === token ? qualifiedShortWeekday[2] : '';
+        if (!weekdayText && !shortDay) return { ok: false, reason: 'ambiguous-date', message: '曜日を指定してください。例: 来週の火曜' };
+        const weekday = shortDay ? weekdayIndex[shortDay] : weekdayMap[weekdayText[0]]; const addWeeks = token === '来週' ? 1 : token === '再来週' ? 2 : 0;
         const mondayDay = (date.getUTCDay() + 6) % 7, targetDay = (weekday + 6) % 7;
-        date.setUTCDate(date.getUTCDate() + targetDay - mondayDay + addWeeks * 7); dateToken += 'の' + weekdayText[0];
+        date.setUTCDate(date.getUTCDate() + targetDay - mondayDay + addWeeks * 7); dateToken = shortDay ? qualifiedShortWeekday[0] : dateToken + 'の' + weekdayText[0];
       } else if (/^(今月|来月)$/.test(token)) {
         const m = source.match(/(?:今月|来月)\s*(\d{1,2})日/);
         if (!m) return { ok: false, reason: 'ambiguous-date', message: '日付を指定してください。例: 来月15日' };
@@ -319,15 +374,20 @@ export function parseTaskMemo(text, now = new Date(), timeZone = Intl.DateTimeFo
         const target = weekdayMap[dayName], currentMonday = (date.getUTCDay() + 6) % 7, targetMonday = (target + 6) % 7;
         const weeks = qualifier === '来週' ? 1 : qualifier === '再来週' ? 2 : 0;
         date.setUTCDate(date.getUTCDate() + targetMonday - currentMonday + weeks * 7); dateToken = weekday[0];
+      } else if (bareShortWeekday) {
+        const target = weekdayIndex[bareShortWeekday[1]];
+        date.setUTCDate(date.getUTCDate() + (target - date.getUTCDay() + 7) % 7);
+        dateToken = bareShortWeekday[1];
       }
     }
   }
   if (!dateToken) return { ok: false, reason: 'missing-date', message: 'タスクの日付を追加してください。例: 明日 買い物' };
   const dateOnlySource = source.replace(dateToken, ' ');
-  const timeMatch = dateOnlySource.match(/(?:(午前|午後|朝|昼|夕方|夜)\s*(\d{1,2})(?:[:：](\d{1,2})|時(半|\d{1,2}分?)?)?|(?<!\d)(\d{1,2})[:：](\d{2})|(?<!\d)(\d{1,2})時(半|\d{1,2}分?)?)/);
+  const timeMatch = dateOnlySource.match(/(?:(午前|午後|朝|昼|夕方|夜)\s*(\d{1,2})(?:[:：](\d{1,2})|時(半|\d{1,2}分?)?)?|(?<!\d)(\d{1,2})[:：](\d{2})|(?<!\d)(\d{1,2})時(半|\d{1,2}分?)?|(?<![^\s日月火水木金土曜)])([0-9]{4})(?![0-9年月./-]))/);
   let dueTime = null;
   if (timeMatch) {
-    let hour = Number(timeMatch[2] || timeMatch[5] || timeMatch[7]), minute = Number(timeMatch[3] || timeMatch[6] || 0);
+    let hour = Number(timeMatch[2] || timeMatch[5] || timeMatch[7] || timeMatch[9]?.slice(0, 2)), minute = Number(timeMatch[3] || timeMatch[6] || 0);
+    if (timeMatch[9]) minute = Number(timeMatch[9].slice(2));
     if ((timeMatch[4] || timeMatch[8] || '').includes('半')) minute = 30;
     const minuteSuffix = (timeMatch[4] || timeMatch[8] || '').match(/(\d{1,2})分/); if (minuteSuffix) minute = Number(minuteSuffix[1]);
     const meridiem = timeMatch[1];
@@ -340,6 +400,7 @@ export function parseTaskMemo(text, now = new Date(), timeZone = Intl.DateTimeFo
   let title = source.replace(absolute?.[0] || monthDay?.[0] || slashDay?.[0] || dateToken, ' ')
     .replace(/(?:今日|本日|明日|あした|明後日|あさって|今週|来週|再来週|今月|来月)/g, ' ')
     .replace(/(?:日|月|火|水|木|金|土)曜(?:日)?/g, ' ')
+    .replace(/(?:今週|来週|再来週)の?[日月火水木金土](?!曜|日|[一-龯々ぁ-んァ-ヶ])|(?:^|\s)[日月火水木金土](?=\s|[0-9]|$)/g, ' ')
     .replace(timeMatch?.[0] || /$^/, ' ')
     .replace(/(?:までに|期限|締切)/g, ' ')
     .replace(/[、,。・\s]+/g, ' ').trim();

@@ -98,6 +98,27 @@ test("Wrangler production bundle serves a page whose embedded parser runs indepe
     ["ワンキャリア", "2026-10-29T01:00:00.000Z", "2026-10-29T02:00:00.000Z"],
     ["ワンキャリア", "2026-11-05T05:00:00.000Z", "2026-11-05T06:00:00.000Z"],
   ]);
+  const namedLines = context.window.michiParser(
+    "来週火 バイト早番\n来週水 バイト遅番",
+    new Date("2026-10-21T02:00:00.000Z"),
+    "Asia/Tokyo",
+    [
+      { id: "early", shortcut: "バイト早番", title: "アルバイト", time: "07:30", durationMinutes: 240, recurrence: "weekly" },
+      { id: "late", shortcut: "バイト遅番", title: "アルバイト", time: "17:00", durationMinutes: 120, recurrence: null },
+    ],
+  );
+  assert.equal(namedLines.ok, true);
+  assert.deepEqual(Array.from(namedLines.events, event => [event.start, event.end]), [
+    ["2026-10-26T22:30:00.000Z", "2026-10-27T02:30:00.000Z"],
+    ["2026-10-28T08:00:00.000Z", "2026-10-28T10:00:00.000Z"],
+  ]);
+  const fourDigit = context.window.michiParser("来週火 １１００ 会議", new Date("2026-10-21T02:00:00.000Z"), "Asia/Tokyo");
+  assert.equal(fourDigit.ok, true);
+  assert.equal(fourDigit.event.start, "2026-10-27T02:00:00.000Z");
+  const invalidLine = context.window.michiParser("今日 1100 会議\n明日 1260 会議", new Date("2026-10-21T02:00:00.000Z"), "Asia/Tokyo");
+  assert.equal(invalidLine.ok, false);
+  assert.match(invalidLine.message, /^行2:/);
+  assert.equal(invalidLine.events, undefined);
   const incompletePairs = context.window.michiParser(
     "10/29 10:00と11/5 ワンキャリア",
     new Date("2026-10-21T03:00:00.000Z"),

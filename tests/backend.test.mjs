@@ -194,7 +194,8 @@ test("saved templates are validated, account-scoped, and supplied to the server 
   ];
   const save = await handleApi(new Request("https://app.example/api/templates", { method: "PUT", headers, body: JSON.stringify({ templates }) }), env, {});
   assert.equal(save.status, 200);
-  assert.deepEqual((await save.json()).templates, templates);
+  const readable = templates.map(template => ({ ...template, shortcut: `${template.title}${template.time}`, aliases: [template.shortcut] }));
+  assert.deepEqual((await save.json()).templates, readable);
   const invalid = await handleApi(new Request("https://app.example/api/templates", { method: "PUT", headers, body: JSON.stringify({ templates: [{ ...templates[0], time: "25:00" }] }) }), env, {});
   assert.equal(invalid.status, 400);
   assert.equal((await handleApi(new Request("https://app.example/api/templates"), env, {})).status, 401);
@@ -202,7 +203,7 @@ test("saved templates are validated, account-scoped, and supplied to the server 
   assert.deepEqual((await otherUser.json()).templates, []);
 
   const get = await handleApi(new Request("https://app.example/api/templates", { headers: { cookie: await cookie() } }), env, {});
-  assert.deepEqual((await get.json()).templates, templates);
+  assert.deepEqual((await get.json()).templates, readable);
   const parse = await handleApi(new Request("https://app.example/api/parse", { method: "POST", headers, body: JSON.stringify({ text: "来週火曜①", timezone: "Asia/Tokyo" }) }), env, {});
   const result = await parse.json();
   assert.equal(result.mode, "rules");
@@ -213,6 +214,77 @@ test("saved templates are validated, account-scoped, and supplied to the server 
   assert.equal(`${parts.find(x => x.type === "hour").value}:${parts.find(x => x.type === "minute").value}`, "17:00");
   const second = await handleApi(new Request("https://app.example/api/parse", { method: "POST", headers, body: JSON.stringify({ text: "来週火曜②", timezone: "Asia/Tokyo" }) }), env, {});
   assert.equal((await second.json()).event.start.slice(11, 16), "12:00", "UTC representation of 21:00 JST is 12:00Z");
+});
+
+test("named template shortcuts normalize safely, reject normalized duplicates, and stay account-scoped", async () => {
+  const db = fakeDb(), env = { DB: db, APP_SESSION_SECRET: secret };
+  const headers = { cookie: await cookie(), origin: "https://app.example", "content-type": "application/json" };
+  const templates = [{ id: "early", shortcut: "  バイト早番  ", title: "バイト", time: "17:00", durationMinutes: 240, recurrence: null }];
+  const save = await handleApi(new Request("https://app.example/api/templates", { method: "PUT", headers, body: JSON.stringify({ templates }) }), env, {});
+  assert.equal(save.status, 200);
+  assert.equal((await save.json()).templates[0].shortcut, "バイト早番");
+  const duplicate = await handleApi(new Request("https://app.example/api/templates", { method: "PUT", headers, body: JSON.stringify({ templates: [{ ...templates[0], shortcut: "Ａ早番" }, { ...templates[0], id: "duplicate", shortcut: "A早番" }] }) }), env, {});
+  assert.equal(duplicate.status, 400);
+  for (const shortcut of ["", "\n", "朝\t番", "あ".repeat(41)]) {
+    const invalid = await handleApi(new Request("https://app.example/api/templates", { method: "PUT", headers, body: JSON.stringify({ templates: [{ ...templates[0], shortcut }] }) }), env, {});
+    assert.equal(invalid.status, 400, JSON.stringify(shortcut));
+  }
+  const other = await handleApi(new Request("https://app.example/api/templates", { headers: { cookie: await cookie("other") } }), env, {});
+  assert.deepEqual((await other.json()).templates, []);
+});
+
+test("legacy circled rows remain stored while GET exposes readable collision-safe names", async () => {
+  const db = fakeDb(), env = { DB: db, APP_SESSION_SECRET: secret };
+  const headers = { cookie: await cookie(), origin: "https://app.example", "content-type": "application/json" };
+  for (const [id, shortcut, time] of [["legacy-a", "①", "17:00"], ["legacy-c", "②", "21:00"], ["legacy-b", "③", "17:00"]]) {
+    db.templates.set(`google-user-1\0${id}`, { user_id: "google-user-1", id, shortcut, title: "バイト", time, duration_minutes: 240, recurrence: null });
+  }
+  const before = [...db.templates.values()].map(row => row.shortcut);
+  const response = await handleApi(new Request("https://app.example/api/templates", { headers }), env, {});
+  const result = await response.json();
+  assert.deepEqual(result.templates.map(item => item.shortcut), ["バイト17:00", "バイト21:00", "バイト17:00（2）"]);
+  assert.deepEqual(result.templates.find(item => item.shortcut === "バイト17:00（2）").aliases, ["③"]);
+  assert.deepEqual([...db.templates.values()].map(row => row.shortcut), before, "GET must not rewrite legacy data");
+});
+
+test("all 20 colliding legacy names stay within the normalized 40-character limit and survive PUT", async () => {
+  const db = fakeDb(), env = { DB: db, APP_SESSION_SECRET: secret };
+  const headers = { cookie: await cookie(), origin: "https://app.example", "content-type": "application/json" };
+  const circles = Array.from("①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳");
+  circles.forEach((shortcut, index) => {
+    const id = `legacy-${String(index + 1).padStart(2, "0")}`;
+    db.templates.set(`google-user-1\0${id}`, { user_id: "google-user-1", id, shortcut, title: "ﬃ".repeat(100), time: "17:00", duration_minutes: 60, recurrence: null });
+  });
+  const getResponse = await handleApi(new Request("https://app.example/api/templates", { headers }), env, {});
+  const get = await getResponse.json();
+  assert.equal(get.templates.length, 20);
+  assert.ok(get.templates.every(item => Array.from(item.shortcut.normalize("NFKC")).length <= 40));
+  const putResponse = await handleApi(new Request("https://app.example/api/templates", { method: "PUT", headers, body: JSON.stringify({ templates: get.templates }) }), env, {});
+  assert.equal(putResponse.status, 200);
+  const put = await putResponse.json();
+  assert.deepEqual(put.templates.map(item => item.shortcut), get.templates.map(item => item.shortcut));
+  assert.equal([...db.templates.values()].filter(row => circles.includes(row.shortcut)).length, 20, "round-trip must preserve every stored legacy slot");
+});
+
+test("named template multi-line parsing returns both events and never sends them through AI", async () => {
+  let aiCalls = 0;
+  const db = fakeDb(), env = { DB: db, APP_SESSION_SECRET: secret, AI: { async run() { aiCalls++; return { response: '{"title":"collapsed"}' }; } } };
+  const headers = { cookie: await cookie(), origin: "https://app.example", "content-type": "application/json" };
+  const templates = [
+    { id: "early", shortcut: "バイト早番", title: "アルバイト", time: "07:00", durationMinutes: 240, recurrence: null },
+    { id: "late", shortcut: "バイト遅番", title: "アルバイト", time: "17:00", durationMinutes: 120, recurrence: null },
+  ];
+  await handleApi(new Request("https://app.example/api/templates", { method: "PUT", headers, body: JSON.stringify({ templates }) }), env, {});
+  const parse = text => handleApi(new Request("https://app.example/api/parse", { method: "POST", headers, body: JSON.stringify({ text, timezone: "Asia/Tokyo" }) }), env, {});
+  const result = await (await parse("来週月 0700 バイト早番\n来週火 1700 バイト遅番")).json();
+  assert.equal(result.needsClarification, false);
+  assert.equal(result.mode, "rules");
+  assert.deepEqual(result.events.map(event => event.title), ["アルバイト", "アルバイト"]);
+  assert.deepEqual(result.events.map(event => event.start), ["2026-11-01T22:00:00.000Z", "2026-11-03T08:00:00.000Z"]);
+  const invalid = await (await parse("来週月 0700 バイト早番\n来週火 2460 バイト遅番")).json();
+  assert.equal(invalid.needsClarification, true);
+  assert.equal(invalid.events, undefined, "an invalid later line must not return earlier events");
+  assert.equal(aiCalls, 0, "AI must not collapse named-template batches");
 });
 
 test("server parse preserves every weekday in a batch and does not send batches through AI", async () => {
