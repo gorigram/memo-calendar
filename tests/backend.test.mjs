@@ -276,12 +276,12 @@ test("named template multi-line parsing returns both events and never sends them
   ];
   await handleApi(new Request("https://app.example/api/templates", { method: "PUT", headers, body: JSON.stringify({ templates }) }), env, {});
   const parse = text => handleApi(new Request("https://app.example/api/parse", { method: "POST", headers, body: JSON.stringify({ text, timezone: "Asia/Tokyo" }) }), env, {});
-  const result = await (await parse("来週月 0700 バイト早番\n来週火 1700 バイト遅番")).json();
+  const result = await (await parse("2026-11-09 0700 バイト早番\n2026-11-10 1700 バイト遅番")).json();
   assert.equal(result.needsClarification, false);
   assert.equal(result.mode, "rules");
   assert.deepEqual(result.events.map(event => event.title), ["アルバイト", "アルバイト"]);
-  assert.deepEqual(result.events.map(event => event.start), ["2026-11-01T22:00:00.000Z", "2026-11-03T08:00:00.000Z"]);
-  const invalid = await (await parse("来週月 0700 バイト早番\n来週火 2460 バイト遅番")).json();
+  assert.deepEqual(result.events.map(event => event.start), ["2026-11-08T22:00:00.000Z", "2026-11-10T08:00:00.000Z"]);
+  const invalid = await (await parse("2026-11-09 0700 バイト早番\n2026-11-10 2460 バイト遅番")).json();
   assert.equal(invalid.needsClarification, true);
   assert.equal(invalid.events, undefined, "an invalid later line must not return earlier events");
   assert.equal(aiCalls, 0, "AI must not collapse named-template batches");

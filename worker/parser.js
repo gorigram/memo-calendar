@@ -230,12 +230,23 @@ export function parseMemo(text, now = new Date(), timeZone = Intl.DateTimeFormat
   }
   // An omitted date means today; a vague date never silently becomes a different day.
 
-  const timeMatch = source.match(/(?:(午前|午後|朝|昼|夕方|夜)\s*(\d{1,2})(?:[:：](\d{1,2})|時(半|\d{1,2}分?)?)?|(?<!\d)(\d{1,2})[:：](\d{2})|(?<!\d)(\d{1,2})時(半|\d{1,2}分?)?|(?<![^\s日月火水木金土曜)])([0-9]{4})(?![0-9年月./-]))/);
+  const scheduleClockPattern = /(?:(午前|午後|朝|昼|夕方|夜)\s*(\d{1,2})(?:[:：](\d{1,2})|時(半|\d{1,2}分?)?)?|(?<!\d)(\d{1,2})[:：](\d{2})|(?<!\d)(\d{1,2})時(半|\d{1,2}分?)?|(?<![^\s日月火水木金土曜)])([0-9]{4})(?![0-9年月./-]))/;
+  const compactRangeCandidate = source.match(/(?<![^\s日月火水木金土曜)])([0-9]{4})\s*[-‐‑‒–—−]\s*([0-9]{4})(?![0-9年月./-])/);
+  const earlierClock = compactRangeCandidate ? source.slice(0, compactRangeCandidate.index).match(scheduleClockPattern) : null;
+  const compactClockRange = earlierClock ? null : compactRangeCandidate;
+  const timeMatch = compactClockRange ? null : source.match(scheduleClockPattern);
   let meridiem = '', hour, minute = 0;
   const savedDuration = Number(template?.durationMinutes);
   let durationMinutes = Number.isFinite(savedDuration) && savedDuration >= 5 && savedDuration <= 1440 ? savedDuration : 60;
   let durationSpecified = Number.isFinite(savedDuration) && savedDuration >= 5 && savedDuration <= 1440;
-  if (timeMatch) {
+  if (compactClockRange) {
+    hour = Number(compactClockRange[1].slice(0, 2));
+    minute = Number(compactClockRange[1].slice(2));
+    const endHour = Number(compactClockRange[2].slice(0, 2));
+    const endMinute = Number(compactClockRange[2].slice(2));
+    if (hour > 23 || minute > 59 || endHour > 23 || endMinute > 59) return { ok: false, needsClarification: true, reason: 'invalid-time', message: '時刻を確認してください。' };
+    date.setUTCHours(hour, minute, 0, 0);
+  } else if (timeMatch) {
     hour = Number(timeMatch[2] || timeMatch[5] || timeMatch[7] || timeMatch[9]?.slice(0, 2));
     minute = Number(timeMatch[3] || timeMatch[6] || 0);
     if (timeMatch[9]) minute = Number(timeMatch[9].slice(2));
@@ -256,9 +267,20 @@ export function parseMemo(text, now = new Date(), timeZone = Intl.DateTimeFormat
     date.setUTCHours(hour, minute, 0, 0);
   } else return { ok: false, needsClarification: true, reason: 'missing-time', message: '開始時刻を追加してください。例: 14時から' };
 
-  const durationSource = source.replace(timeMatch?.[0] || /$^/, ' ');
+  const durationSource = source.replace(compactClockRange?.[0] || timeMatch?.[0] || /$^/, ' ');
   const duration = durationSource.match(/(?:所要時間|約)?\s*(\d+)\s*(時間|分)(半)?(?:ほど|くらい|程度)?/);
   if (duration) { durationSpecified = true; durationMinutes = Number(duration[1]) * (duration[2] === '時間' ? 60 : 1) + (duration[3] && duration[2] === '時間' ? 30 : 0); }
+  else if (compactClockRange) {
+    durationSpecified = true;
+    const end = new Date(date);
+    end.setUTCHours(Number(compactClockRange[2].slice(0, 2)), Number(compactClockRange[2].slice(2)), 0, 0);
+    durationMinutes = Math.round((end - date) / 60000);
+    if (durationMinutes <= 0) {
+      const impliedOvernight = hour >= 20 && Number(compactClockRange[2].slice(0, 2)) <= 6;
+      if (!impliedOvernight) return { ok: false, needsClarification: true, reason: 'invalid-range', message: '終了時刻が開始時刻より前です。翌日の予定なら日付も指定してください。' };
+      durationMinutes += 1440;
+    }
+  }
   else {
     const range = durationSource.match(/(?:から|〜|～|－|—)\s*(午前|午後|夕方|夜|昼|朝)?\s*(?:([0-9]{4})(?![0-9年月./-])|(\d{1,2})(?::(\d{2})|時(半|\d{1,2}分?)?)?)/);
     if (range) {
@@ -289,9 +311,9 @@ export function parseMemo(text, now = new Date(), timeZone = Intl.DateTimeFormat
     .replace(/(?:今日|本日|明日|あした|明後日|あさって|今週|来週|再来週|今月|来月)/g, '')
     .replace(/(?:日|月|火|水|木|金|土)曜(?:日)?/g, '')
     .replace(/(?:今週|来週|再来週)の?[日月火水木金土](?!曜|日|[一-龯々ぁ-んァ-ヶ])|(?:^|\s)[日月火水木金土](?=\s|[0-9]|$)/g, ' ')
-    .replace(timeMatch?.[0] || /$^/, '')
+    .replace(compactClockRange?.[0] || timeMatch?.[0] || /$^/, '')
     .replace(/(?:所要時間|約)?\s*\d+\s*(?:時間|分)(?:半)?(?:ほど|くらい|程度)?/g, '')
-    .replace(/(?:から|〜|～|-|所要時間)\s*(?:\d+\s*(?:時間|分)(?:半)?|(?:午後|午前)?\s*(?:[0-9]{4}(?![0-9年月./-])|\d{1,2}(?::\d{2})?\s*(?:時)?(?:分)?))(?:ほど|くらい|程度)?/g, '')
+    .replace(/(?:から|〜|～|所要時間)\s*(?:\d+\s*(?:時間|分)(?:半)?|(?:午後|午前)?\s*(?:[0-9]{4}(?![0-9年月./-])|\d{1,2}(?::\d{2})?\s*(?:時)?(?:分)?))(?:ほど|くらい|程度)?/g, '')
     .replace(/毎週|毎日|毎月|繰り返し/g, '')
     .replace(/^\s*(?:(?:に|から|より|の)\s*)+/, '')
     .replace(/[、,。・\s]+$/g, '').replace(/^[、,。・\s]+/g, '').replace(/\s+/g, ' ').trim();

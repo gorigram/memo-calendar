@@ -385,3 +385,57 @@ test('matches named and legacy template aliases before extracting clock digits',
   assert.equal(mixedLines.ok, true);
   assert.deepEqual(mixedLines.events.map(event => event.title), ['アルバイト', 'アルバイト']);
 });
+
+test('parses compact HHmm-to-HHmm schedule ranges without changing single clocks or date hyphens', () => {
+  const now = new Date('2026-11-04T02:00:00Z');
+  const cases = [
+    ['明日 1800-2000 バイト', '2026-11-05T09:00:00.000Z', '2026-11-05T11:00:00.000Z'],
+    ['今日 1800–2000 会議', '2026-11-04T09:00:00.000Z', '2026-11-04T11:00:00.000Z'],
+    ['今日 １８００－２０００ 会議', '2026-11-04T09:00:00.000Z', '2026-11-04T11:00:00.000Z'],
+    ['来週火1800 - 2000 会議', '2026-11-10T09:00:00.000Z', '2026-11-10T11:00:00.000Z'],
+  ];
+  for (const [memo, start, end] of cases) {
+    const result = parseMemo(memo, now, 'Asia/Tokyo');
+    assert.equal(result.ok, true, memo);
+    assert.equal(result.event.start, start, memo);
+    assert.equal(result.event.end, end, memo);
+    assert.equal(result.durationSpecified, true, memo);
+  }
+
+  const multiline = parseMemo('今日 1800-2000 会議\n明日 1900-2100 食事', now, 'Asia/Tokyo');
+  assert.equal(multiline.ok, true);
+  assert.deepEqual(multiline.events.map(event => [event.title, event.start, event.end]), [
+    ['会議', '2026-11-04T09:00:00.000Z', '2026-11-04T11:00:00.000Z'],
+    ['食事', '2026-11-05T10:00:00.000Z', '2026-11-05T12:00:00.000Z'],
+  ]);
+
+  const single = parseMemo('今日 1800 会議', now, 'Asia/Tokyo');
+  assert.equal(single.ok, true);
+  assert.equal(single.event.start, '2026-11-04T09:00:00.000Z');
+  assert.equal(single.event.end, '2026-11-04T10:00:00.000Z');
+  const numericTitle = parseMemo('明日 1100 計画 2020-2026', now, 'Asia/Tokyo');
+  assert.equal(numericTitle.ok, true);
+  assert.equal(numericTitle.event.start, '2026-11-05T02:00:00.000Z');
+  assert.equal(numericTitle.event.title, '計画 2020-2026');
+  assert.equal(parseMemo('2026-11-04 18:00 会議', now, 'Asia/Tokyo').event.title, '会議');
+  assert.equal(parseMemo('2026-11-04 1800 会議', now, 'Asia/Tokyo').event.title, '会議');
+});
+
+test('rejects invalid or reversed compact HHmm ranges instead of parsing a partial clock', () => {
+  const now = new Date('2026-11-04T02:00:00Z');
+  for (const [memo, reason] of [
+    ['今日 2460-2000 会議', 'invalid-time'],
+    ['今日 1800-2460 会議', 'invalid-time'],
+    ['今日 2400-2500 会議', 'invalid-time'],
+    ['今日 2000-1800 会議', 'invalid-range'],
+    ['今日 1800-1800 会議', 'invalid-range'],
+  ]) {
+    const result = parseMemo(memo, now, 'Asia/Tokyo');
+    assert.equal(result.ok, false, memo);
+    assert.equal(result.reason, reason, memo);
+    assert.equal(result.events, undefined, memo);
+  }
+  const overnight = parseMemo('今日 2300-0100 夜勤', now, 'Asia/Tokyo');
+  assert.equal(overnight.ok, true);
+  assert.equal(overnight.event.end, '2026-11-04T16:00:00.000Z');
+});
