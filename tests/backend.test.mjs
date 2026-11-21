@@ -5,8 +5,8 @@ import { handleApi } from "../worker/backend.js";
 
 globalThis.crypto ||= webcrypto;
 const secret = "test-session-secret-that-is-long-enough";
-async function cookie(sub = "google-user-1") {
-  const payload = btoa(JSON.stringify({ sub, exp: Date.now() + 60_000 })).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+async function cookie(sub = "google-user-1", exp = Date.now() + 60_000) {
+  const payload = btoa(JSON.stringify({ sub, exp })).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
   const signature = btoa(String.fromCharCode(...new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload))))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   return `memo_session=${payload}.${signature}`;
@@ -65,6 +65,7 @@ async function encryptedToken(token) {
 test("reports local mode when D1 is not bound", async () => {
   const response = await handleApi(new Request("https://app.example/api/status"), {}, {});
   assert.equal(response.status, 200);
+  assert.equal(response.headers.get("set-cookie"), null);
   assert.deepEqual(await response.json(), { ok: true, mode: "local", storage: "unavailable", authenticated: false, accountKey: null, google: { configured: false, connected: false }, ai: "rules" });
 });
 
@@ -76,6 +77,49 @@ test("reports an authenticated cloud account independently from Google Calendar 
   assert.equal(typeof value.accountKey, "string");
   assert.equal(value.accountKey.length, 16);
   assert.notEqual(value.accountKey, "google-user-1");
+});
+
+test("renews a valid browser session for 30 days from app activity", async () => {
+  const env = { DB: fakeDb(), APP_SESSION_SECRET: secret };
+  const now = Date.now();
+  const before = await cookie("google-user-1", now + 60_000);
+  const status = await handleApi(new Request("https://app.example/api/status", {
+    headers: { cookie: before, "sec-fetch-site": "same-origin" }
+  }), env, {});
+  const renewed = status.headers.get("set-cookie");
+  assert.match(renewed, /^memo_session=.+; Path=\/; HttpOnly; Secure; SameSite=Lax; Max-Age=2592000$/);
+  const sessionCookie = renewed.split(";")[0];
+  assert.notEqual(sessionCookie, before);
+  const encodedPayload = sessionCookie.slice("memo_session=".length).split(".")[0];
+  const payload = JSON.parse(Buffer.from(encodedPayload, "base64url").toString("utf8"));
+  assert.equal(payload.sub, "google-user-1");
+  const lifetime = 30 * 24 * 60 * 60 * 1000;
+  assert.ok(payload.exp >= now + lifetime && payload.exp <= Date.now() + lifetime);
+
+  const events = await handleApi(new Request("https://app.example/api/events", {
+    headers: { cookie: sessionCookie }
+  }), env, {});
+  assert.equal(events.status, 200);
+});
+
+test("keeps expired, invalid, cross-site, and trusted-site sessions from being renewed", async () => {
+  const env = { DB: fakeDb(), APP_SESSION_SECRET: secret };
+  const valid = await cookie();
+  const invalid = valid.replace(/\.[^.]+$/, ".INVALID");
+  const cases = [
+    { headers: { cookie: await cookie("google-user-1", Date.now() - 1) }, authenticated: false },
+    { headers: { cookie: invalid }, authenticated: false },
+    { headers: { cookie: valid, "sec-fetch-site": "cross-site" }, authenticated: true },
+    { headers: { cookie: valid, "oai-authenticated-user-id": "site-user" }, authenticated: true, trusted: true }
+  ];
+  for (const { headers, authenticated, trusted } of cases) {
+    const response = await handleApi(new Request("https://app.example/api/status", { headers }), {
+      ...env,
+      TRUST_SITES_IDENTITY: trusted ? "true" : "false"
+    }, {});
+    assert.equal((await response.json()).authenticated, authenticated);
+    assert.equal(response.headers.get("set-cookie"), null);
+  }
 });
 
 test("rejects malformed JSON and missing text with structured errors", async () => {

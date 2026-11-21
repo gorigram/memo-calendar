@@ -7,6 +7,7 @@ const GOOGLE_TOKEN = "https://oauth2.googleapis.com/token";
 const CALENDAR = "https://www.googleapis.com/calendar/v3";
 const SCOPES = "openid email https://www.googleapis.com/auth/calendar.events";
 const MAX_GOOGLE_IMPORT_WINDOW_MS = 93 * 24 * 60 * 60 * 1000;
+const APP_SESSION_MAX_AGE = 30 * 24 * 60 * 60;
 const json = (value, status = 200, headers = {}) => new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", ...headers } });
 const err = (message, status = 400) => json({ ok: false, error: message }, status);
 const b64 = (bytes) => btoa(String.fromCharCode(...new Uint8Array(bytes))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
@@ -18,9 +19,12 @@ const db = (env) => env.DB;
 const configured = (env) => Boolean(env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET && env.TOKEN_ENCRYPTION_KEY && (env.TRUST_SITES_IDENTITY === "true" || env.APP_SESSION_SECRET));
 const cookies = (request) => Object.fromEntries((request.headers.get("cookie") || "").split(";").map(x => x.trim().split(/=(.*)/s).slice(0, 2)).filter(x => x.length === 2));
 async function signSession(sub, env) {
-  const payload = b64(new TextEncoder().encode(JSON.stringify({ sub, exp: Date.now() + 30 * 864e5 })));
+  const payload = b64(new TextEncoder().encode(JSON.stringify({ sub, exp: Date.now() + APP_SESSION_MAX_AGE * 1000 })));
   const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(env.APP_SESSION_SECRET), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
   return `${payload}.${b64(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload)))}`;
+}
+async function sessionCookie(sub, env) {
+  return `${COOKIE}=${await signSession(sub, env)}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${APP_SESSION_MAX_AGE}`;
 }
 async function userId(request, env) {
   if (env.TRUST_SITES_IDENTITY === "true") {
@@ -332,7 +336,7 @@ async function oauthCallback(request, env) {
   const refreshEnc = refresh ? await encrypt(refresh, env) : existing.refresh_token_enc;
   await db(env).prepare("INSERT INTO google_tokens (user_id,refresh_token_enc,access_token_enc,access_expires,updated_at) VALUES (?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET refresh_token_enc=excluded.refresh_token_enc,access_token_enc=excluded.access_token_enc,access_expires=excluded.access_expires,updated_at=excluded.updated_at").bind(ownerId, refreshEnc, await encrypt(tokens.access_token, env), Date.now() + (tokens.expires_in || 3600) * 1000, new Date().toISOString()).run();
   const headers = { location: `${origin}/?google=connected`, "cache-control": "no-store", "set-cookie": `${OAUTH_COOKIE}=; Path=/api/google; HttpOnly; Secure; SameSite=Lax; Max-Age=0` };
-  if (env.TRUST_SITES_IDENTITY !== "true") headers["set-cookie"] = `${COOKIE}=${await signSession(ownerId, env)}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=2592000`;
+  if (env.TRUST_SITES_IDENTITY !== "true") headers["set-cookie"] = await sessionCookie(ownerId, env);
   return new Response(null, { status: 302, headers });
 }
 async function calendarEvent(sub, event, env) {
@@ -440,9 +444,12 @@ export async function handleApi(request, env, ctx) {
   if (!path.startsWith("/api/")) return null;
   if (!(await checkOrigin(request, env)) && request.method !== "GET") return err("Origin is not allowed", 403);
   if (path === "/api/status" && request.method === "GET") {
-    const sub = await userId(request, env); let connected = false;
-    if (sub && await requireDb(env)) connected = Boolean(await db(env).prepare("SELECT user_id FROM google_tokens WHERE user_id = ?").bind(sub).first());
-    return json({ ok: true, mode: await requireDb(env) ? "cloud" : "local", storage: await requireDb(env) ? "d1" : "unavailable", authenticated: Boolean(sub), accountKey: sub ? (await sha(sub)).slice(0, 16) : null, google: { configured: configured(env), connected }, ai: !env.AI?.run ? "rules" : sub ? "available" : "requires-signin" });
+    const sub = await userId(request, env), hasDb = await requireDb(env); let connected = false;
+    if (sub && hasDb) connected = Boolean(await db(env).prepare("SELECT user_id FROM google_tokens WHERE user_id = ?").bind(sub).first());
+    const fetchSite = request.headers.get("sec-fetch-site");
+    const mayRenewSession = sub && hasDb && env.TRUST_SITES_IDENTITY !== "true" && (!fetchSite || fetchSite === "same-origin");
+    const headers = mayRenewSession ? { "set-cookie": await sessionCookie(sub, env) } : {};
+    return json({ ok: true, mode: hasDb ? "cloud" : "local", storage: hasDb ? "d1" : "unavailable", authenticated: Boolean(sub), accountKey: sub ? (await sha(sub)).slice(0, 16) : null, google: { configured: configured(env), connected }, ai: !env.AI?.run ? "rules" : sub ? "available" : "requires-signin" }, 200, headers);
   }
   if (path === "/api/parse" && request.method === "POST") return parseMemo(request, env);
   if (path === "/api/templates") {
